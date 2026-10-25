@@ -1,0 +1,129 @@
+#!/usr/bin/python3 -I
+# glasspad-pizarra-teclas - lee el teclado y entrega solo los atajos (corre como root con pkexec)
+# kan0p - https://github.com/kan0p/glasspad-pizarra - GPL-3.0-or-later
+#
+# Escribe una línea por evento en la salida estándar:
+#   atajo ctrl+shift+KEY_T       una combinación reconocida como atajo (super solo: Super)
+#   clic izquierdo|derecho|medio
+# Termina al cerrarse la entrada estándar. Lo que se escribe nunca sale de este proceso:
+# las letras, números y signos sin Ctrl, Alt ni Super se descartan aquí.
+
+import os, select, sys
+
+import evdev
+from evdev import ecodes as e
+
+MODIFICADORES = {e.KEY_LEFTCTRL: "ctrl", e.KEY_RIGHTCTRL: "ctrl", e.KEY_LEFTALT: "alt",
+                 e.KEY_LEFTSHIFT: "shift", e.KEY_RIGHTSHIFT: "shift",
+                 e.KEY_LEFTMETA: "super", e.KEY_RIGHTMETA: "super"}
+# AltGr escribe caracteres (@, #, [...): no cuenta como modificador
+ORDEN = ("super", "ctrl", "alt", "shift")
+FLECHAS = {e.KEY_LEFT, e.KEY_RIGHT, e.KEY_UP, e.KEY_DOWN}
+FUNCION = {getattr(e, f"KEY_F{n}") for n in range(1, 25)}
+# atajos aunque se pulsen solas
+SOLAS = FUNCION | FLECHAS | {e.KEY_SYSRQ}
+# con Shift (sin Ctrl, Alt ni Super) son atajos; Shift con una letra es escribir
+CON_SHIFT = SOLAS | {e.KEY_TAB, e.KEY_HOME, e.KEY_END, e.KEY_PAGEUP, e.KEY_PAGEDOWN,
+                     e.KEY_INSERT, e.KEY_DELETE}
+BOTONES = {e.BTN_LEFT: "izquierdo", e.BTN_RIGHT: "derecho", e.BTN_MIDDLE: "medio"}
+# el teclado virtual de Number Key y el pad del ScreenPad (lo toma el launcher)
+IGNORADOS = ("GlassPad Number Key", "GDX1515")
+REVISAR_S = 2
+
+
+def nombre(codigo):
+    n = e.KEY.get(codigo) or e.BTN.get(codigo)
+    return n[0] if isinstance(n, list) else n
+
+
+def dispositivos(abiertos):
+    """Abre los teclados y mouse nuevos; cierra los que ya no están."""
+    rutas = set(evdev.list_devices())
+    for ruta in list(abiertos):
+        if ruta not in rutas:
+            abiertos.pop(ruta).close()
+    for ruta in rutas - set(abiertos):
+        try:
+            d = evdev.InputDevice(ruta)
+        except OSError:
+            continue
+        teclas = set(d.capabilities().get(e.EV_KEY, []))
+        if any(i in d.name for i in IGNORADOS) or not (
+                e.KEY_LEFTCTRL in teclas or e.BTN_LEFT in teclas):
+            d.close()
+            continue
+        abiertos[ruta] = d
+
+
+def salir():
+    os._exit(0)
+
+
+def enviar(linea):
+    try:
+        sys.stdout.write(linea + "\n")
+        sys.stdout.flush()
+    except OSError:
+        salir()
+
+
+def main():
+    if os.geteuid() != 0:
+        print("glasspad-pizarra-teclas: se usa con pkexec", file=sys.stderr)
+        return 1
+    abiertos = {}
+    dispositivos(abiertos)
+    pulsados = {}           # código de modificador -> nombre
+    super_solo = False      # Super se soltó sin pulsar otra tecla: abre el lanzador
+    padre = os.getppid()
+    while True:
+        listos, _, _ = select.select([sys.stdin, *abiertos.values()], [], [], REVISAR_S)
+        if os.getppid() != padre:
+            salir()
+        if not listos:
+            dispositivos(abiertos)
+            continue
+        for d in listos:
+            if d is sys.stdin:
+                if not os.read(sys.stdin.fileno(), 4096):
+                    salir()
+                continue
+            try:
+                eventos = list(d.read())
+            except OSError:
+                dispositivos(abiertos)
+                break
+            for ev in eventos:
+                if ev.type != e.EV_KEY:
+                    continue
+                if ev.code in BOTONES:
+                    if ev.value == 1:
+                        enviar("clic " + BOTONES[ev.code])
+                    continue
+                if ev.code in MODIFICADORES:
+                    if ev.value == 1:
+                        pulsados[ev.code] = MODIFICADORES[ev.code]
+                        super_solo = MODIFICADORES[ev.code] == "super" and len(pulsados) == 1
+                    elif ev.value == 0:
+                        if pulsados.pop(ev.code, None) == "super" and super_solo:
+                            enviar("atajo super")
+                        super_solo = False
+                    continue
+                if ev.value != 1:
+                    continue        # soltar y repetición
+                super_solo = False
+                mods = set(pulsados.values())
+                if mods & {"ctrl", "alt", "super"}:
+                    pass
+                elif mods == {"shift"} and ev.code in CON_SHIFT:
+                    pass
+                elif not mods and ev.code in SOLAS:
+                    pass
+                else:
+                    continue
+                teclas = [m for m in ORDEN if m in mods]
+                enviar("atajo " + "+".join([*teclas, nombre(ev.code)]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

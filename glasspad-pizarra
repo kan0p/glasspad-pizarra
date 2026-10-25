@@ -3,7 +3,7 @@
 # kan0p - https://github.com/kan0p/glasspad-pizarra - GPL-3.0-or-later
 #
 # uso: glasspad-pizarra [--debug]
-#      glasspad-pizarra alternar escribir|foco | deshacer | borrar | apagar
+#      glasspad-pizarra alternar escribir|foco|teclas | deshacer | borrar | apagar
 
 import os, sys
 
@@ -22,7 +22,7 @@ def cliente(args):
                              Gio.DBusCallFlags.NONE, 5000, None)
 
     try:
-        if args[0] == "alternar" and len(args) == 2 and args[1] in ("escribir", "foco"):
+        if args[0] == "alternar" and len(args) == 2 and args[1] in ("escribir", "foco", "teclas"):
             estado = llamar("Estado", None, "(a{sv})").unpack()[0]
             llamar("Ajustar", GLib.Variant("(a{sv})", (
                 {args[1]: GLib.Variant("b", not estado[args[1]])},)))
@@ -33,7 +33,7 @@ def cliente(args):
         elif args == ["apagar"]:
             llamar("ApagarTodo")
         else:
-            print("uso: glasspad-pizarra alternar escribir|foco | deshacer | borrar | apagar",
+            print("uso: glasspad-pizarra alternar escribir|foco|teclas | deshacer | borrar | apagar",
                   file=sys.stderr)
             return 2
     except GLib.Error as e:
@@ -48,6 +48,7 @@ if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
 # gtk4-layer-shell debe cargarse antes que libwayland-client
 LIB_LAYER = "libgtk4-layer-shell.so.0"
 if LIB_LAYER not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["_PIZARRA_LD_PRELOAD"] = os.environ.get("LD_PRELOAD", "")
     os.environ["LD_PRELOAD"] = " ".join(filter(None, [LIB_LAYER, os.environ.get("LD_PRELOAD")]))
     os.execv(sys.executable, [sys.executable, *sys.argv])
 # todo se dibuja con cairo en memoria: sin texturas nuevas de GSK en cada cuadro
@@ -68,6 +69,13 @@ try:
     signal_add = GLibUnix.signal_add
 except (ValueError, ImportError):
     signal_add = GLib.unix_signal_add
+
+# la biblioteca ya está cargada: pkexec y los demás hijos no la necesitan
+if os.environ.get("_PIZARRA_LD_PRELOAD"):
+    os.environ["LD_PRELOAD"] = os.environ["_PIZARRA_LD_PRELOAD"]
+else:
+    os.environ.pop("LD_PRELOAD", None)
+os.environ.pop("_PIZARRA_LD_PRELOAD", None)
 
 DEBUG = "--debug" in sys.argv
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
@@ -94,9 +102,12 @@ QUIETO = 30                 # capturas sin movimiento para pasar a CAPTURA_QUIET
 
 PREDETERMINADO = {"escribir": False, "herramienta": "lapiz", "color": "rojo", "grosor": 2,
                   "fondo": "transparente", "borrar_al_pasar": True,
-                  "foco": False, "radio": 160, "oscuro": 70, "anillo": True}
+                  "foco": False, "radio": 160, "oscuro": 70, "anillo": True, "clics": True,
+                  "teclas": False, "windows": True, "posicion": "centro", "tamano": "m"}
 GUARDADOS = ("herramienta", "color", "grosor", "fondo", "borrar_al_pasar",
-             "radio", "oscuro", "anillo")
+             "radio", "oscuro", "anillo", "clics", "windows", "posicion", "tamano")
+POSICIONES = ("centro", "derecha")
+TAMANOS = {"s": 0.8, "m": 1.0, "l": 1.3}
 
 XML = f"""
 <node>
@@ -108,6 +119,7 @@ XML = f"""
     <method name="CambioDiapositiva"/>
     <method name="Estado"><arg type="a{{sv}}" name="estado" direction="out"/></method>
     <signal name="Cambio"><arg type="a{{sv}}" name="estado"/></signal>
+    <signal name="Aviso"><arg type="s" name="texto"/></signal>
   </interface>
 </node>
 """
@@ -119,6 +131,26 @@ window.pizarra { background: transparent; }
 .pizarra-aviso .titulo { font-weight: 600; }
 .pizarra-aviso .pista { color: alpha(white, 0.7); }
 .pizarra-punto { min-width: 12px; min-height: 12px; border-radius: 6px; }
+.pizarra-tarjeta { background: alpha(#12141c, 0.92); color: white; border-radius: 20px;
+                   padding: 14px 22px; margin: 0 16px; transition: opacity 250ms; }
+.pizarra-tarjeta.anterior { opacity: 0.5; }
+.pizarra-tarjeta.saliendo { opacity: 0; }
+.pizarra-tecla { background: #2b3040; border-radius: 10px; border-bottom: 4px solid #0c0e13;
+                 padding: 6px 16px; font-size: 24px; font-weight: 600; }
+.pizarra-tecla-sub { font-size: 11px; font-weight: 500; color: #9aa3b5; }
+.pizarra-mas { color: #8a93a6; font-size: 22px; }
+.pizarra-veces { color: #6aa8ff; font-size: 22px; font-weight: 700; margin-left: 6px; }
+.pizarra-desc { font-size: 15px; }
+.pizarra-igual { font-size: 14px; color: alpha(white, 0.7); }
+.pizarra-win { background: #1d3357; color: #b9d4ff; border-radius: 999px; padding: 3px 12px;
+               font-size: 13px; font-weight: 600; }
+.pizarra-teclas-s .pizarra-tecla, .pizarra-teclas-s .pizarra-mas,
+.pizarra-teclas-s .pizarra-veces { font-size: 18px; }
+.pizarra-teclas-s .pizarra-desc { font-size: 13px; }
+.pizarra-teclas-l .pizarra-tecla, .pizarra-teclas-l .pizarra-mas,
+.pizarra-teclas-l .pizarra-veces { font-size: 32px; }
+.pizarra-teclas-l .pizarra-desc { font-size: 19px; }
+.pizarra-teclas-l .pizarra-win, .pizarra-teclas-l .pizarra-igual { font-size: 16px; }
 """ + b"".join(f".pizarra-punto.{n} {{ background: {c}; }}\n".encode()
                for n, c in COLORES.items())
 
@@ -168,7 +200,12 @@ def valido(clave, valor):
             "herramienta": lambda v: v in HERRAMIENTAS,
             "color": lambda v: v in COLORES,
             "grosor": lambda v: entero(v, 1, 3),
-            "fondo": lambda v: v in FONDOS}.get(clave, lambda v: False)(valor)
+            "fondo": lambda v: v in FONDOS,
+            "teclas": lambda v: isinstance(v, bool),
+            "windows": lambda v: isinstance(v, bool),
+            "clics": lambda v: isinstance(v, bool),
+            "posicion": lambda v: v in POSICIONES,
+            "tamano": lambda v: v in TAMANOS}.get(clave, lambda v: False)(valor)
 
 
 def variante(v):
@@ -219,6 +256,9 @@ class Foco:
 
     BORDE = 3           # px de degradado a cada lado del radio
     ANILLO = 2
+    ONDA_S = 0.35       # duración de la marca de un clic
+    ONDAS = {"izquierdo": (0.96, 0.78, 0.30), "derecho": (0.42, 0.66, 1.0),
+             "medio": (1.0, 1.0, 1.0)}
 
     def __init__(self, conector, escala, ajustes):
         self.conector = conector
@@ -257,6 +297,7 @@ class Foco:
         self.sucio = False
         self.mapa = None
         self.sello = None           # (clave de ajustes, ImageSurface del círculo)
+        self.ondas = []             # (inicio, color) de los clics que se están marcando
         self.registro = self._nuevo("registro")
         self._enviar(1, 1, struct.pack("<I", self.registro))
         self._sync("globales")
@@ -277,6 +318,11 @@ class Foco:
             self.mapa.close()
             self.mapa = None
         debug("foco: apagado")
+
+    def clic(self, boton):
+        if self.s and boton in self.ONDAS:
+            self.ondas.append((time.monotonic(), self.ONDAS[boton]))
+            self._pedir_cuadro()
 
     def repintar(self):
         """Los ajustes cambiaron: se repinta todo en ambos búferes."""
@@ -566,6 +612,15 @@ class Foco:
         cr.set_source_surface(self._circulo(), x - lado, y - lado)
         cr.rectangle(caja[0], caja[1], caja[2] - caja[0], caja[3] - caja[1])
         cr.fill()
+        ahora = time.monotonic()
+        self.ondas = [(t, c) for t, c in self.ondas if ahora - t < self.ONDA_S]
+        cr.set_operator(cairo.OPERATOR_OVER)
+        for t, color in self.ondas:
+            f = (ahora - t) / self.ONDA_S
+            cr.arc(x, y, (8 + 30 * f) * self.escala, 0, 2 * math.pi)
+            cr.set_source_rgba(*color, 0.85 * (1 - f))
+            cr.set_line_width(3 * self.escala)
+            cr.stroke()
         bb["sup"].flush()
         bb["completo"] = False
         bb["caja"] = caja
@@ -582,6 +637,8 @@ class Foco:
         self._enviar(self.superficie, 3, struct.pack("<I", self._nuevo("cuadro")))
         self._enviar(self.superficie, 6)
         self.mostrada = caja
+        if self.ondas:
+            self.sucio = True       # el próximo cuadro sigue la animación
 
     # ----- cursor ------------------------------------------------------------
 
@@ -611,6 +668,338 @@ class Foco:
         self._enviar(self.frame, 2, struct.pack("<iiii", 0, 0, w, h))
         self._enviar(self.frame, 3)
         return False
+
+
+# ----- atajos ----------------------------------------------------------------
+
+AYUDANTES = ["/usr/local/libexec/glasspad-pizarra-teclas",
+             "/usr/lib/glasspad-pizarra/glasspad-pizarra-teclas"]
+XKB_COSMIC = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "cosmic", "com.system76.CosmicComp", "v1", "xkb_config")
+TARJETA_S = 2.5             # lo que se ve cada atajo
+TARJETAS = 2                # como mucho, el último y el anterior
+MODS_ORDEN = ("super", "ctrl", "alt", "shift")
+
+# código evdev -> nombre de tecla al estilo de xkb, para buscar equivalencias
+TECLAS_FIJAS = {"KEY_TAB": "tab", "KEY_ESC": "escape", "KEY_SPACE": "space",
+                "KEY_ENTER": "enter", "KEY_KPENTER": "enter", "KEY_BACKSPACE": "backspace",
+                "KEY_DELETE": "delete", "KEY_INSERT": "insert", "KEY_HOME": "home",
+                "KEY_END": "end", "KEY_PAGEUP": "pageup", "KEY_PAGEDOWN": "pagedown",
+                "KEY_LEFT": "left", "KEY_RIGHT": "right", "KEY_UP": "up", "KEY_DOWN": "down",
+                "KEY_SYSRQ": "print", "KEY_KPPLUS": "plus", "KEY_KPMINUS": "minus"}
+# teclas de signos sin Shift, según la distribución
+SIGNOS = {
+    "us": {"KEY_MINUS": "minus", "KEY_EQUAL": "equal", "KEY_LEFTBRACE": "bracketleft",
+           "KEY_RIGHTBRACE": "bracketright", "KEY_SEMICOLON": "semicolon",
+           "KEY_APOSTROPHE": "apostrophe", "KEY_GRAVE": "grave", "KEY_BACKSLASH": "backslash",
+           "KEY_COMMA": "comma", "KEY_DOT": "period", "KEY_SLASH": "slash",
+           "KEY_102ND": "less"},
+    "latam": {"KEY_MINUS": "apostrophe", "KEY_EQUAL": "questiondown",
+              "KEY_LEFTBRACE": "acute", "KEY_RIGHTBRACE": "plus", "KEY_SEMICOLON": "ntilde",
+              "KEY_APOSTROPHE": "braceleft", "KEY_GRAVE": "bar", "KEY_BACKSLASH": "braceright",
+              "KEY_COMMA": "comma", "KEY_DOT": "period", "KEY_SLASH": "minus",
+              "KEY_102ND": "less"},
+    "es": {"KEY_MINUS": "apostrophe", "KEY_EQUAL": "exclamdown", "KEY_LEFTBRACE": "grave",
+           "KEY_RIGHTBRACE": "plus", "KEY_SEMICOLON": "ntilde", "KEY_APOSTROPHE": "acute",
+           "KEY_GRAVE": "masculine", "KEY_BACKSLASH": "ccedilla", "KEY_COMMA": "comma",
+           "KEY_DOT": "period", "KEY_SLASH": "minus", "KEY_102ND": "less"},
+}
+ETIQUETAS = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "super": "Super",
+             "tab": "Tab", "escape": "Esc", "space": "Espacio", "enter": "Enter",
+             "backspace": "Retroceso", "delete": "Supr", "insert": "Insert", "home": "Inicio",
+             "end": "Fin", "pageup": "RePág", "pagedown": "AvPág", "left": "←", "right": "→",
+             "up": "↑", "down": "↓", "print": "Impr Pant", "minus": "-", "equal": "=",
+             "plus": "+", "comma": ",", "period": ".", "slash": "/", "backslash": "\\",
+             "apostrophe": "'", "semicolon": ";", "grave": "`", "acute": "´",
+             "bracketleft": "[", "bracketright": "]", "braceleft": "{", "braceright": "}",
+             "bar": "|", "less": "<", "ntilde": "Ñ", "ccedilla": "Ç", "questiondown": "¿",
+             "exclamdown": "¡", "masculine": "º", "win": "⊞ Win"}
+
+# atajo -> (qué hace, en Windows): "" es igual en Windows; None, sin equivalente
+EQUIVALENCIAS = {
+    "ctrl+c": ("Copiar", ""), "ctrl+x": ("Cortar", ""), "ctrl+v": ("Pegar", ""),
+    "ctrl+shift+v": ("Pegar sin formato", ""), "ctrl+z": ("Deshacer", ""),
+    "ctrl+y": ("Rehacer", ""), "ctrl+shift+z": ("Rehacer", "ctrl+y"),
+    "ctrl+a": ("Seleccionar todo", ""), "ctrl+s": ("Guardar", ""),
+    "ctrl+shift+s": ("Guardar como", ""), "ctrl+o": ("Abrir", ""), "ctrl+n": ("Nuevo", ""),
+    "ctrl+p": ("Imprimir", ""), "ctrl+f": ("Buscar", ""), "ctrl+h": ("Reemplazar", ""),
+    "ctrl+b": ("Negrita", ""), "ctrl+i": ("Cursiva", ""), "ctrl+u": ("Subrayado", ""),
+    "ctrl+t": ("Nueva pestaña", ""), "ctrl+w": ("Cerrar la pestaña", ""),
+    "ctrl+shift+t": ("Reabrir la pestaña cerrada", ""),
+    "ctrl+tab": ("Pestaña siguiente", ""), "ctrl+shift+tab": ("Pestaña anterior", ""),
+    "ctrl+l": ("Ir a la barra de direcciones", ""), "ctrl+r": ("Recargar", ""),
+    "ctrl+plus": ("Acercar", ""), "ctrl+equal": ("Acercar", ""), "ctrl+minus": ("Alejar", ""),
+    "ctrl+0": ("Tamaño normal", ""), "ctrl+home": ("Ir al principio", ""),
+    "ctrl+end": ("Ir al final", ""), "ctrl+left": ("Palabra o celda anterior", ""),
+    "ctrl+right": ("Palabra o celda siguiente", ""), "ctrl+up": ("Subir hasta el borde", ""),
+    "ctrl+down": ("Bajar hasta el borde", ""), "ctrl+shift+left": ("Seleccionar hasta el borde", ""),
+    "ctrl+shift+right": ("Seleccionar hasta el borde", ""),
+    "ctrl+shift+up": ("Seleccionar hasta el borde", ""),
+    "ctrl+shift+down": ("Seleccionar hasta el borde", ""),
+    "ctrl+pageup": ("Hoja anterior", ""), "ctrl+pagedown": ("Hoja siguiente", ""),
+    "shift+left": ("Ampliar la selección", ""), "shift+right": ("Ampliar la selección", ""),
+    "shift+up": ("Ampliar la selección", ""), "shift+down": ("Ampliar la selección", ""),
+    "shift+tab": ("Campo anterior", ""), "shift+f5": ("Presentar desde la diapositiva actual", ""),
+    "alt+tab": ("Cambiar de ventana", ""), "alt+shift+tab": ("Ventana anterior", ""),
+    "alt+f4": ("Cerrar la ventana", ""), "alt+left": ("Atrás", ""), "alt+right": ("Adelante", ""),
+    "f2": ("Editar o renombrar", ""), "f5": ("Recargar o iniciar la presentación", ""),
+    "f11": ("Pantalla completa", ""), "f12": ("Guardar como (Office)", ""),
+    "print": ("Captura de pantalla", "win+shift+s"),
+    "super": ("Lanzador de apps", "win"),
+    "super+slash": ("Lanzador de apps", "win+s"),
+    "super+a": ("Todas las apps", "win"),
+    "super+w": ("Ver los espacios de trabajo", "win+tab"),
+    "super+escape": ("Bloquear la sesión", "win+l"),
+    "super+shift+escape": ("Cerrar la sesión", "ctrl+alt+delete"),
+    "super+q": ("Cerrar la ventana", "alt+f4"),
+    "super+tab": ("Cambiar de ventana", "alt+tab"),
+    "super+shift+tab": ("Ventana anterior", "alt+shift+tab"),
+    "super+m": ("Maximizar", "win+up"), "super+f11": ("Pantalla completa", "f11"),
+    "super+f": ("Abrir la carpeta personal", "win+e"), "super+b": ("Abrir el navegador", None),
+    "super+t": ("Abrir la terminal", None), "super+v": ("Historial del portapapeles", "win+v"),
+    "super+space": ("Cambiar la distribución del teclado", "win+space"),
+    "super+equal": ("Zoom: acercar", "win+plus"), "super+period": ("Zoom: acercar", "win+plus"),
+    "super+minus": ("Zoom: alejar", "win+minus"), "super+comma": ("Zoom: alejar", "win+minus"),
+    "super+left": ("Ir a la ventana de la izquierda", None),
+    "super+right": ("Ir a la ventana de la derecha", None),
+    "super+up": ("Ir a la ventana de arriba", None),
+    "super+down": ("Ir a la ventana de abajo", None),
+    "super+shift+left": ("Mover la ventana a la izquierda", "win+left"),
+    "super+shift+right": ("Mover la ventana a la derecha", "win+right"),
+    "super+shift+up": ("Mover la ventana arriba", "win+up"),
+    "super+shift+down": ("Mover la ventana abajo", "win+down"),
+    "super+ctrl+left": ("Espacio de trabajo anterior", "win+ctrl+left"),
+    "super+ctrl+up": ("Espacio de trabajo anterior", "win+ctrl+left"),
+    "super+ctrl+right": ("Espacio de trabajo siguiente", "win+ctrl+right"),
+    "super+ctrl+down": ("Espacio de trabajo siguiente", "win+ctrl+right"),
+    "super+y": ("Activar o desactivar el mosaico", None),
+    "super+g": ("Ventana flotante", None),
+}
+for _n in range(1, 10):
+    EQUIVALENCIAS[f"super+{_n}"] = (f"Ir al espacio de trabajo {_n}", None)
+    EQUIVALENCIAS[f"super+shift+{_n}"] = (f"Mover la ventana al espacio {_n}", None)
+
+
+def distribucion():
+    """La primera distribución de COSMIC; si no se puede leer, us."""
+    try:
+        with open(XKB_COSMIC) as f:
+            texto = f.read()
+        i = texto.index("layout:")
+        valor = texto[i:].split('"')[1]
+    except (OSError, ValueError, IndexError):
+        return "us"
+    return valor.split(",")[0].strip() or "us"
+
+
+def nombre_tecla(codigo, signos):
+    """KEY_T -> 't', KEY_F5 -> 'f5', KEY_SLASH -> 'minus' en latam."""
+    if codigo in ("super", "ctrl", "alt", "shift"):
+        return codigo
+    if codigo in TECLAS_FIJAS:
+        return TECLAS_FIJAS[codigo]
+    if codigo in signos:
+        return signos[codigo]
+    n = codigo.removeprefix("KEY_").removeprefix("BTN_").lower()
+    return n
+
+
+def etiquetas(atajo, windows):
+    """'super+shift+t' -> ['⊞ Win', 'Shift', 'T'] o ['Super', 'Shift', 'T']."""
+    salida = []
+    for p in atajo.split("+"):
+        if p in ("super", "win"):
+            salida.append(ETIQUETAS["win"] if windows else "Super")
+        elif p in ETIQUETAS:
+            salida.append(ETIQUETAS[p])
+        else:
+            salida.append(p.upper() if len(p) == 1 else p.capitalize())
+    return salida
+
+
+class Lector:
+    """El ayudante de root que lee el teclado, abierto con pkexec mientras haga falta."""
+
+    def __init__(self, al_atajo, al_clic, al_fallar):
+        self.al_atajo = al_atajo
+        self.al_clic = al_clic
+        self.al_fallar = al_fallar
+        self.proc = None
+
+    def encender(self):
+        if self.proc:
+            return
+        ayudante = next((r for r in AYUDANTES if os.access(r, os.X_OK)), None)
+        if not ayudante:
+            self.al_fallar("Falta la parte del sistema: sudo ./install.sh --sistema")
+            return
+        try:
+            self.proc = Gio.Subprocess.new(["pkexec", ayudante], Gio.SubprocessFlags.STDIN_PIPE
+                                           | Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as e:
+            self.al_fallar(f"No se pudo abrir el lector de teclas: {e.message}")
+            return
+        self.cancelar = Gio.Cancellable()
+        self.entrada = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self._leer()
+        self.proc.wait_async(None, self._termino)
+        debug("teclas: lector abierto")
+
+    def apagar(self):
+        if not self.proc:
+            return
+        proc, self.proc = self.proc, None
+        self.cancelar.cancel()
+        # el ayudante corre como root: no se le puede mandar una señal, sale al cerrar su entrada
+        proc.get_stdin_pipe().close()
+        debug("teclas: lector cerrado")
+
+    def _leer(self):
+        self.entrada.read_line_async(GLib.PRIORITY_DEFAULT, self.cancelar, self._linea)
+
+    def _linea(self, flujo, res):
+        try:
+            linea, _largo = flujo.read_line_finish_utf8(res)
+        except GLib.Error:
+            return
+        if linea is None:
+            return
+        tipo, _, dato = linea.partition(" ")
+        if tipo == "atajo":
+            self.al_atajo(dato)
+        elif tipo == "clic":
+            self.al_clic(dato)
+        self._leer()
+
+    def _termino(self, proc, res):
+        try:
+            proc.wait_finish(res)
+        except GLib.Error:
+            pass
+        if proc is not self.proc:
+            return          # se cerró a propósito
+        self.proc = None
+        codigo = proc.get_exit_status() if proc.get_if_exited() else -1
+        self.al_fallar("Sin permiso para leer el teclado" if codigo in (126, 127)
+                       else f"El lector de teclas se cerró ({codigo})")
+
+
+class Tarjetas:
+    """Los atajos en una capa abajo de la pantalla principal; nunca toma el mouse."""
+
+    def __init__(self, app):
+        self.app = app
+        self.ventana = None
+        self.vivas = []         # [{"caja", "atajo", "veces", "etiqueta_veces", "espera"}]
+
+    def _crear(self):
+        v = Gtk.Window(application=self.app, css_classes=["pizarra"])
+        Capa.init_for_window(v)
+        Capa.set_namespace(v, "glasspad-teclas")
+        m = monitor_principal()
+        if m:
+            Capa.set_monitor(v, m)
+        Capa.set_keyboard_mode(v, Capa.KeyboardMode.NONE)
+        Capa.set_layer(v, Capa.Layer.OVERLAY)
+        self.caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                            width_request=1, height_request=1, can_target=False)
+        v.set_child(self.caja)
+        v.connect("realize", lambda _v: self._region())
+        self.ventana = v
+        self.reubicar()
+        v.present()
+
+    def _region(self):
+        superficie = self.ventana.get_surface() if self.ventana else None
+        if superficie:
+            superficie.set_input_region(cairo.Region())
+
+    def reubicar(self):
+        if not self.ventana:
+            return
+        e = self.app.estado
+        derecha = e["posicion"] == "derecha"
+        Capa.set_anchor(self.ventana, Capa.Edge.BOTTOM, True)
+        Capa.set_anchor(self.ventana, Capa.Edge.RIGHT, derecha)
+        Capa.set_margin(self.ventana, Capa.Edge.BOTTOM, 40)
+        Capa.set_margin(self.ventana, Capa.Edge.RIGHT, 40 if derecha else 0)
+        self.caja.set_halign(Gtk.Align.END if derecha else Gtk.Align.CENTER)
+        for t in TAMANOS:
+            self.caja.remove_css_class(f"pizarra-teclas-{t}")
+        self.caja.add_css_class(f"pizarra-teclas-{e['tamano']}")
+
+    def mostrar(self, atajo, descripcion, windows):
+        if self.ventana is None:
+            self._crear()
+        con_windows = self.app.estado["windows"]
+        ultima = self.vivas[-1] if self.vivas else None
+        if ultima and ultima["atajo"] == atajo and not ultima["saliendo"]:
+            ultima["veces"] += 1
+            ultima["etiqueta_veces"].set_label(f"×{ultima['veces']}")
+            ultima["etiqueta_veces"].set_visible(True)
+            self._programar(ultima)
+            return
+        tarjeta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          halign=self.caja.get_halign(), css_classes=["pizarra-tarjeta"])
+        fila = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        for i, (parte, texto) in enumerate(zip(atajo.split("+"), etiquetas(atajo, con_windows))):
+            if i:
+                fila.append(Gtk.Label(label="+", css_classes=["pizarra-mas"]))
+            if parte == "super" and con_windows:
+                tecla = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["pizarra-tecla"],
+                                valign=Gtk.Align.CENTER)
+                tecla.append(Gtk.Label(label=texto))
+                tecla.append(Gtk.Label(label="Super", css_classes=["pizarra-tecla-sub"]))
+                fila.append(tecla)
+            else:
+                fila.append(Gtk.Label(label=texto, css_classes=["pizarra-tecla"],
+                                      valign=Gtk.Align.CENTER))
+        veces = Gtk.Label(css_classes=["pizarra-veces"], visible=False)
+        fila.append(veces)
+        tarjeta.append(fila)
+        abajo = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
+        if descripcion:
+            abajo.append(Gtk.Label(label=descripcion, css_classes=["pizarra-desc"]))
+        if con_windows and windows == "" and descripcion:
+            abajo.append(Gtk.Label(label="· igual en Windows", css_classes=["pizarra-igual"]))
+        elif con_windows and windows:
+            abajo.append(Gtk.Label(label="En Windows: " + " + ".join(etiquetas(windows, True)),
+                                   css_classes=["pizarra-win"]))
+        if abajo.get_first_child():
+            tarjeta.append(abajo)
+        for vieja in self.vivas:
+            vieja["caja"].add_css_class("anterior")
+        while len(self.vivas) >= TARJETAS:
+            self._quitar(self.vivas[0])
+        viva = {"caja": tarjeta, "atajo": atajo, "veces": 1, "etiqueta_veces": veces,
+                "espera": 0, "saliendo": False}
+        self.vivas.append(viva)
+        self.caja.append(tarjeta)
+        self._programar(viva)
+        self._region()
+
+    def _programar(self, viva):
+        if viva["espera"]:
+            GLib.source_remove(viva["espera"])
+        viva["espera"] = GLib.timeout_add(int(TARJETA_S * 1000), self._desvanecer, viva)
+
+    def _desvanecer(self, viva):
+        viva["espera"] = 0
+        viva["saliendo"] = True
+        viva["caja"].add_css_class("saliendo")
+        viva["espera"] = GLib.timeout_add(260, lambda: self._quitar(viva) and False)
+        return False
+
+    def _quitar(self, viva):
+        if viva in self.vivas:
+            if viva["espera"]:
+                GLib.source_remove(viva["espera"])
+            self.vivas.remove(viva)
+            self.caja.remove(viva["caja"])
+
+    def vaciar(self):
+        for viva in list(self.vivas):
+            self._quitar(viva)
 
 
 class Trazo:
@@ -702,6 +1091,10 @@ class Pizarra(Gtk.Application):
         self.conexion = None
         self.foco = None
         self.achicada = False
+        self.lector = Lector(self._atajo, self._clic, self._fallo_lector)
+        self.tarjetas = Tarjetas(self)
+        self.signos = SIGNOS["us"]
+        self.sin_lector = False     # el lector falló: no se reintenta hasta que se pida otra vez
 
     # ----- arranque ----------------------------------------------------------
 
@@ -775,7 +1168,7 @@ class Pizarra(Gtk.Application):
                 self.paginas[f] = []
                 self.historial[f] = []
             self.lasers = []
-            self._ajustar({"escribir": False, "foco": False})
+            self._ajustar({"escribir": False, "foco": False, "teclas": False})
         elif metodo == "CambioDiapositiva":
             if self.estado["borrar_al_pasar"] and self.paginas["transparente"]:
                 self._guardar_historial("transparente")
@@ -811,9 +1204,43 @@ class Pizarra(Gtk.Application):
             self._seguir_cursor(self.estado["foco"])
         elif self.foco and any(self.estado[k] != antes[k] for k in ("radio", "oscuro", "anillo")):
             self.foco.repintar()
+        if self.estado["teclas"] and not antes["teclas"]:
+            self.signos = SIGNOS.get(distribucion(), SIGNOS["us"])
+        if not self.estado["teclas"]:
+            self.tarjetas.vaciar()
+        if any(self.estado[k] != antes[k] for k in ("posicion", "tamano")):
+            self.tarjetas.reubicar()
+        if any(cambios.get(k) is True for k in ("teclas", "foco", "clics")):
+            self.sin_lector = False
+        if not self.sin_lector and (self.estado["teclas"]
+                                    or (self.estado["foco"] and self.estado["clics"])):
+            self.lector.encender()
+        else:
+            self.lector.apagar()
         self._cambio()
         if aviso:
             self._mostrar_aviso()
+
+    # ----- teclas ------------------------------------------------------------
+
+    def _atajo(self, texto):
+        if not self.estado["teclas"]:
+            return
+        atajo = "+".join(nombre_tecla(p, self.signos) for p in texto.split("+"))
+        descripcion, windows = EQUIVALENCIAS.get(atajo, (None, None))
+        self.tarjetas.mostrar(atajo, descripcion, windows)
+
+    def _clic(self, boton):
+        if self.foco and self.estado["foco"] and self.estado["clics"]:
+            self.foco.clic(boton)
+
+    def _fallo_lector(self, texto):
+        log("teclas:", texto)
+        self.sin_lector = True
+        if self.conexion:
+            self.conexion.emit_signal(None, RUTA, INTERFAZ, "Aviso", GLib.Variant("(s)", (texto,)))
+        # puede llegar desde dentro de _ajustar
+        GLib.idle_add(lambda: self.estado["teclas"] and self._ajustar({"teclas": False}) and False)
 
     # ----- foco --------------------------------------------------------------
 

@@ -4,13 +4,12 @@ Herramientas para dar clases con el ScreenPad de la ZenBook Pro 15 UX580: escrib
 
 Funciona encima de cualquier ventana, también de una presentación a pantalla completa (PowerPoint Online, Google Slides, LibreOffice Impress): las herramientas se dibujan en una capa por encima de todo y el teclado sigue llegando a la presentación.
 
-Estado: **Escribir** y **Foco** están listos. **Teclas** llega en la próxima versión.
-
 ## Requisitos
 
 - GlassPad 0.9.1 o posterior, con el launcher funcionando
 - COSMIC u otro compositor Wayland con `wlr-layer-shell`
 - `python-cairo`, `gtk4-layer-shell` y `wtype`
+- Para Teclas y la marca de clics: `python-evdev` y `polkit`
 
 ## Instalación
 
@@ -21,6 +20,14 @@ cd glasspad-pizarra
 ```
 
 Se instala para el usuario, sin root: el programa en `~/.local/bin`, el complemento en `~/.local/share/glasspad/complementos/pizarra` y un servicio de usuario que D-Bus inicia la primera vez que se usa. Para quitarlo: `./install.sh --quitar`.
+
+Teclas y la marca de clics del Foco necesitan leer el teclado y el mouse, y eso va aparte, con root:
+
+```sh
+sudo ./install.sh --sistema
+```
+
+Instala el lector en `/usr/local/libexec/glasspad-pizarra-teclas` y una acción de polkit que permite abrirlo con `pkexec` sin contraseña, solo desde la sesión local activa. Para quitarlo: `sudo ./install.sh --sistema --quitar`.
 
 ## Escribir
 
@@ -43,6 +50,25 @@ Tocar **Foco** oscurece la pantalla principal salvo un círculo que sigue al cur
 
 COSMIC informa la posición del cursor solo mientras se captura su imagen (`ext-image-copy-capture-v1`, 24×24 px), así que el foco la captura 60 veces por segundo mientras el cursor se mueve y 10 cuando está quieto. El oscurecido es una capa propia que en cada cuadro repinta solo el cuadrado alrededor del círculo: con el mouse en movimiento gasta alrededor del 6 % de un núcleo, y quieto, menos del 1 %.
 
+Con **Marcar clics**, cada clic dentro del foco deja una onda: amarilla el izquierdo, azul el derecho.
+
+## Teclas
+
+Tocar **Teclas** muestra abajo de la pantalla principal los atajos que se pulsan, con lo que hacen y su equivalente en Windows: Super se muestra como **⊞ Win**, y si en Windows el atajo es otro, aparece debajo (Super+Esc bloquea la sesión; en Windows, ⊞ Win + L).
+
+Muestra **solo atajos**, nunca lo que se escribe:
+
+- combinaciones con Ctrl, Alt o Super (AltGr no cuenta: escribe caracteres);
+- Shift con una tecla que no escribe texto: Shift+Tab, Shift+flechas, Shift+F5;
+- las flechas, las teclas de función e Impr Pant solas;
+- Super solo, que abre el lanzador.
+
+Si se repite el mismo atajo, la tarjeta cuenta las veces (→ ×5) en lugar de sumar otra.
+
+El filtro está dentro del lector, que corre como root: las letras, números y signos escritos sin Ctrl, Alt ni Super se descartan ahí y nunca llegan a la sesión. El lector solo corre mientras Teclas o la marca de clics están encendidos, y se cierra solo al apagarlos. No lee el teclado virtual de Number Key ni el pad del ScreenPad.
+
+Los nombres de los signos siguen la distribución de teclado de COSMIC (`us`, `latam` y `es`). **Como en Linux** muestra Super sin los nombres de Windows. La posición (abajo al centro o a la derecha) y el tamaño se eligen en el pad.
+
 Los ajustes se guardan en `~/.local/state/glasspad/pizarra.json`.
 
 ## Desde la terminal
@@ -50,6 +76,7 @@ Los ajustes se guardan en `~/.local/state/glasspad/pizarra.json`.
 ```sh
 glasspad-pizarra alternar escribir
 glasspad-pizarra alternar foco
+glasspad-pizarra alternar teclas
 glasspad-pizarra deshacer
 glasspad-pizarra borrar
 glasspad-pizarra apagar

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Instala GlassPad Pizarra para el usuario actual (sin root).
 # uso: ./install.sh [--quitar]
+#      sudo ./install.sh --sistema [--quitar]    el lector de teclas y su regla de polkit
 set -eu
 
 AQUI=$(cd "$(dirname "$0")" && pwd)
@@ -10,9 +11,35 @@ CONF=${XDG_CONFIG_HOME:-$HOME/.config}
 COMPLEMENTO=$DATOS/glasspad/complementos/pizarra
 UNIDAD=$CONF/systemd/user/glasspad-pizarra.service
 DBUS=$DATOS/dbus-1/services/io.github.kan0p.GlassPad.Pizarra.service
+# fuera de $HOME y de root: pkexec lo corre como root sin contraseña
+LIBEXEC=/usr/local/libexec
+# polkit solo lee acciones de /usr/share
+POLITICA=/usr/share/polkit-1/actions/io.github.kan0p.glasspad.pizarra.policy
+
+if [ "${1:-}" = "--sistema" ]; then
+    if [ "$(id -u)" != 0 ]; then
+        echo "La parte del sistema necesita root: sudo ./install.sh --sistema" >&2
+        exit 1
+    fi
+    if [ "${2:-}" = "--quitar" ]; then
+        rm -f "$LIBEXEC/glasspad-pizarra-teclas" "$POLITICA"
+        echo "Lector de teclas quitado."
+        exit 0
+    fi
+    if ! python3 -c "import evdev" 2>/dev/null; then
+        echo "Falta python-evdev. En Arch: pacman -S python-evdev" >&2
+        exit 1
+    fi
+    install -Dm755 -o root -g root "$AQUI/glasspad-pizarra-teclas" "$LIBEXEC/glasspad-pizarra-teclas"
+    sed "s|@LIBEXEC@|$LIBEXEC|g" "$AQUI/polkit/io.github.kan0p.glasspad.pizarra.policy" > "$POLITICA"
+    chmod 644 "$POLITICA"
+    echo "Lector de teclas instalado en $LIBEXEC."
+    exit 0
+fi
 
 if [ "$(id -u)" = 0 ]; then
     echo "Se instala por usuario: ejecútalo sin sudo." >&2
+    echo "La parte del sistema (Teclas) va aparte: sudo ./install.sh --sistema" >&2
     exit 1
 fi
 
@@ -59,3 +86,6 @@ gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus \
 systemctl --user try-restart glasspad-pizarra
 reiniciar_launcher
 echo "GlassPad Pizarra instalado: el mosaico Pizarra aparece en el inicio del launcher."
+if [ ! -x "$LIBEXEC/glasspad-pizarra-teclas" ]; then
+    echo "Para Teclas y la marca de clics falta la parte del sistema: sudo ./install.sh --sistema"
+fi

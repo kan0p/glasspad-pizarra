@@ -72,7 +72,8 @@ def crear(api):
     api.css(CSS)
     iconos = os.path.join(api.carpeta, "iconos")
     estado = {}
-    grupos = {"herramienta": {}, "color": {}, "grosor": {}, "fondo": {}, "anillo": {}}
+    grupos = {"herramienta": {}, "color": {}, "grosor": {}, "fondo": {}, "anillo": {},
+              "clics": {}, "windows": {}, "posicion": {}, "tamano": {}}
     barras = {}
     avisado = [False]
 
@@ -113,6 +114,8 @@ def crear(api):
 
     bus.signal_subscribe(None, INTERFAZ, "Cambio", RUTA, None, Gio.DBusSignalFlags.NONE,
                          lambda *a: mostrar(a[5].unpack()[0]))
+    bus.signal_subscribe(None, INTERFAZ, "Aviso", RUTA, None, Gio.DBusSignalFlags.NONE,
+                         lambda *a: api.avisar(a[5].unpack()[0]))
 
     # ----- piezas ------------------------------------------------------------
 
@@ -235,9 +238,7 @@ def crear(api):
 
     mosaico("escribir", "Escribir", lambda: tocar("escribir"))
     mosaico("foco", "Foco", lambda: tocar("foco"))
-    mosaico("teclas", "Teclas", lambda: api.avisar("Teclas llega en la próxima versión"))
-    tarjetas["teclas"][0].add_css_class("proximamente")
-    tarjetas["teclas"][3].set_label("Próximamente")
+    mosaico("teclas", "Teclas", lambda: tocar("teclas"))
 
     # ----- ajustes de Escribir ----------------------------------------------
 
@@ -304,8 +305,37 @@ def crear(api):
     f = fila("Anillo")
     for valor, texto in ((True, "Con anillo"), (False, "Sin anillo")):
         f.append(opcion("anillo", valor, lambda v=valor: ajustar(anillo=v), texto))
+    f.append(Gtk.Box(hexpand=True))
+    f.append(Gtk.Label(label="Clics", css_classes=["pizarra-etiqueta"], xalign=1))
+    for valor, texto in ((True, "Marcar clics"), (False, "No marcar")):
+        f.append(opcion("clics", valor, lambda v=valor: ajustar(clics=v), texto))
     panel.append(f)
     ajustes.add_named(panel, "foco")
+
+    # ----- ajustes de Teclas ------------------------------------------------
+
+    panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=28,
+                    css_classes=["pizarra-teclas"])
+    sub = Gtk.Box(spacing=16)
+    sub.append(Gtk.Label(label="Ajustes de Teclas", css_classes=["pizarra-subtitulo"],
+                         xalign=0, hexpand=True))
+    sub.append(Gtk.Label(label="Muestra solo atajos, nunca lo que escribes",
+                         css_classes=["pizarra-gris"]))
+    panel.append(sub)
+    f = fila("Windows")
+    for valor, texto in ((True, "Nombres y atajo de Windows"), (False, "Como en Linux")):
+        f.append(opcion("windows", valor, lambda v=valor: ajustar(windows=v), texto))
+    panel.append(f)
+    f = fila("Posición")
+    for valor, texto in (("centro", "Abajo al centro"), ("derecha", "Abajo a la derecha")):
+        f.append(opcion("posicion", valor, lambda v=valor: ajustar(posicion=v), texto))
+    f.append(Gtk.Box(hexpand=True))
+    f.append(Gtk.Label(label="Tamaño", css_classes=["pizarra-etiqueta"], xalign=1))
+    for valor in ("s", "m", "l"):
+        f.append(opcion("tamano", valor, lambda v=valor: ajustar(tamano=v), valor.upper(),
+                        clases=("pizarra-opcion", "pizarra-grosor")))
+    panel.append(f)
+    ajustes.add_named(panel, "teclas")
     elegir("escribir")
 
     # ----- estado ------------------------------------------------------------
@@ -318,7 +348,8 @@ def crear(api):
         if h != "borrador":
             texto += " " + estado.get("color", "")
         detalles = {"escribir": texto,
-                    "foco": f"radio {estado.get('radio', 0)} px, {estado.get('oscuro', 0)} %"}
+                    "foco": f"radio {estado.get('radio', 0)} px, {estado.get('oscuro', 0)} %",
+                    "teclas": "con Windows" if estado.get("windows") else "como en Linux"}
         for clave, det in detalles.items():
             on = estado.get(clave, False)
             b, interruptor, perilla, detalle = tarjetas[clave]
