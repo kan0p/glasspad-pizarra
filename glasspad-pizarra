@@ -3,7 +3,7 @@
 # kan0p - https://github.com/kan0p/glasspad-pizarra - GPL-3.0-or-later
 #
 # uso: glasspad-pizarra [--debug]
-#      glasspad-pizarra alternar escribir | deshacer | borrar | apagar
+#      glasspad-pizarra alternar escribir|foco | deshacer | borrar | apagar
 
 import os, sys
 
@@ -22,7 +22,7 @@ def cliente(args):
                              Gio.DBusCallFlags.NONE, 5000, None)
 
     try:
-        if args[0] == "alternar" and len(args) == 2 and args[1] in ("escribir",):
+        if args[0] == "alternar" and len(args) == 2 and args[1] in ("escribir", "foco"):
             estado = llamar("Estado", None, "(a{sv})").unpack()[0]
             llamar("Ajustar", GLib.Variant("(a{sv})", (
                 {args[1]: GLib.Variant("b", not estado[args[1]])},)))
@@ -33,7 +33,7 @@ def cliente(args):
         elif args == ["apagar"]:
             llamar("ApagarTodo")
         else:
-            print("uso: glasspad-pizarra alternar escribir | deshacer | borrar | apagar",
+            print("uso: glasspad-pizarra alternar escribir|foco | deshacer | borrar | apagar",
                   file=sys.stderr)
             return 2
     except GLib.Error as e:
@@ -53,7 +53,7 @@ if LIB_LAYER not in os.environ.get("LD_PRELOAD", ""):
 # todo se dibuja con cairo en memoria: sin texturas nuevas de GSK en cada cuadro
 os.environ.setdefault("GSK_RENDERER", "cairo")
 
-import json, math, time
+import array, json, math, mmap, socket, struct, time
 
 import cairo
 import gi
@@ -86,10 +86,17 @@ LASER_VIVE_S = 1.0       # visible entero después de soltar
 LASER_APAGA_S = 0.5      # y luego se desvanece
 HISTORIAL = 100
 AVISO_S = 2.5
+RADIO = (60, 400)           # px
+OSCURO = (30, 90)           # % de negro fuera del foco
+CAPTURA_MS = 16             # una captura del cursor por cuadro como mucho
+CAPTURA_QUIETO_MS = 100     # con el cursor quieto
+QUIETO = 30                 # capturas sin movimiento para pasar a CAPTURA_QUIETO_MS
 
 PREDETERMINADO = {"escribir": False, "herramienta": "lapiz", "color": "rojo", "grosor": 2,
-                  "fondo": "transparente", "borrar_al_pasar": True}
-GUARDADOS = ("herramienta", "color", "grosor", "fondo", "borrar_al_pasar")
+                  "fondo": "transparente", "borrar_al_pasar": True,
+                  "foco": False, "radio": 160, "oscuro": 70, "anillo": True}
+GUARDADOS = ("herramienta", "color", "grosor", "fondo", "borrar_al_pasar",
+             "radio", "oscuro", "anillo")
 
 XML = f"""
 <node>
@@ -151,11 +158,16 @@ def guardar_estado(estado):
 
 
 def valido(clave, valor):
+    entero = lambda v, a, b: isinstance(v, int) and not isinstance(v, bool) and a <= v <= b
     return {"escribir": lambda v: isinstance(v, bool),
             "borrar_al_pasar": lambda v: isinstance(v, bool),
+            "foco": lambda v: isinstance(v, bool),
+            "anillo": lambda v: isinstance(v, bool),
+            "radio": lambda v: entero(v, *RADIO),
+            "oscuro": lambda v: entero(v, *OSCURO),
             "herramienta": lambda v: v in HERRAMIENTAS,
             "color": lambda v: v in COLORES,
-            "grosor": lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 3,
+            "grosor": lambda v: entero(v, 1, 3),
             "fondo": lambda v: v in FONDOS}.get(clave, lambda v: False)(valor)
 
 
@@ -194,6 +206,411 @@ def monitor_principal():
         candidatos.append(m)
     candidatos.sort(key=lambda m: not (m.get_connector() or "").startswith("eDP"))
     return candidatos[0] if candidatos else None
+
+
+class Foco:
+    """El foco que sigue al cursor, con su propia conexión Wayland y sin GTK.
+
+    El compositor solo informa la posición del cursor mientras se captura su imagen
+    (ext-image-copy-capture-v1, 24x24 px), así que se pide una captura por cuadro.
+    El oscurecido es una capa con dos búferes de memoria compartida: en cada cuadro se
+    repinta y se marca como dañado solo el cuadrado alrededor del círculo.
+    """
+
+    BORDE = 3           # px de degradado a cada lado del radio
+    ANILLO = 2
+
+    def __init__(self, conector, escala, ajustes):
+        self.conector = conector
+        self.escala = escala
+        self.ajustes = ajustes          # dict con radio, oscuro y anillo; se lee en cada cuadro
+        self.s = None
+
+    # ----- conexión ----------------------------------------------------------
+
+    def iniciar(self):
+        if self.s:
+            return
+        ruta = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""),
+                            os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+        try:
+            self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.s.connect(ruta)
+        except OSError as e:
+            log(f"foco: no se pudo conectar a Wayland: {e}")
+            self.s = None
+            return
+        self.s.setblocking(False)
+        self.buf = b""
+        self.prox = 1
+        self.globales = {}          # interfaz -> [(nombre, versión)]
+        self.salidas = {}           # id de wl_output -> conector
+        self.objetos = {}           # id -> tipo
+        self.pos = None             # px del búfer
+        self.tam_cursor = self.formato = self.buffer_cursor = None
+        self.frame = None
+        self.espera = 0
+        self.quieto = 0             # capturas seguidas sin que se mueva el cursor
+        self.bufs = []
+        self.mostrada = None        # caja del círculo en el último búfer enviado
+        self.cuadro = False         # hay un wl_callback de cuadro pendiente
+        self.sucio = False
+        self.mapa = None
+        self.sello = None           # (clave de ajustes, ImageSurface del círculo)
+        self.registro = self._nuevo("registro")
+        self._enviar(1, 1, struct.pack("<I", self.registro))
+        self._sync("globales")
+        self.vigia = GLib.io_add_watch(self.s.fileno(), GLib.PRIORITY_DEFAULT,
+                                       GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._leer)
+        debug("foco: encendido en", self.conector)
+
+    def detener(self):
+        if not self.s:
+            return
+        GLib.source_remove(self.vigia)
+        if self.espera:
+            GLib.source_remove(self.espera)
+        self.s.close()
+        self.s = None
+        self.bufs = []
+        if self.mapa:
+            self.mapa.close()
+            self.mapa = None
+        debug("foco: apagado")
+
+    def repintar(self):
+        """Los ajustes cambiaron: se repinta todo en ambos búferes."""
+        for b in self.bufs:
+            b["completo"] = True
+        self._pedir_cuadro()
+
+    def _nuevo(self, tipo):
+        self.prox += 1
+        self.objetos[self.prox] = tipo
+        return self.prox
+
+    def _enviar(self, obj, op, datos=b"", fd=None):
+        msg = struct.pack("<IHH", obj, op, 8 + len(datos)) + datos
+        try:
+            if fd is None:
+                self.s.sendall(msg)
+            else:
+                self.s.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                        array.array("i", [fd]))])
+        except OSError as e:
+            log(f"foco: error de Wayland: {e}")
+            GLib.idle_add(lambda: self.detener() and False)
+
+    def _sync(self, para):
+        self._enviar(1, 0, struct.pack("<I", self._nuevo("sync:" + para)))
+
+    def _enlazar(self, interfaz, version, nombre=None):
+        disponible = self.globales[interfaz][0]
+        nombre = nombre or disponible[0]
+        texto = interfaz.encode() + b"\0"
+        texto += b"\0" * (-len(texto) % 4)
+        nuevo = self._nuevo(interfaz)
+        self._enviar(self.registro, 0, struct.pack("<II", nombre, len(interfaz) + 1) + texto
+                     + struct.pack("<II", min(version, disponible[1]), nuevo))
+        return nuevo
+
+    @staticmethod
+    def _texto(t):
+        b = t.encode() + b"\0"
+        return struct.pack("<I", len(b)) + b + b"\0" * (-len(b) % 4)
+
+    def _leer(self, _fd, condicion):
+        if condicion & (GLib.IO_HUP | GLib.IO_ERR):
+            log("foco: se cerró la conexión con Wayland")
+            self.detener()
+            return False
+        try:
+            datos = self.s.recv(65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            datos = b""
+        if not datos:
+            self.detener()
+            return False
+        self.buf += datos
+        while len(self.buf) >= 8:
+            obj, op, tam = struct.unpack("<IHH", self.buf[:8])
+            if len(self.buf) < tam:
+                break
+            cuerpo, self.buf = self.buf[8:tam], self.buf[tam:]
+            self._evento(obj, op, cuerpo)
+            if not self.s:
+                return False
+        return True
+
+    # ----- eventos -----------------------------------------------------------
+
+    def _evento(self, obj, op, b):
+        tipo = self.objetos.get(obj)
+        if obj == 1:
+            if op == 0:
+                largo = struct.unpack("<I", b[8:12])[0]
+                log("foco: error del compositor:", b[12:12 + largo - 1].decode(errors="replace"))
+                self.detener()
+            elif op == 1:
+                self.objetos.pop(struct.unpack("<I", b)[0], None)
+        elif tipo == "registro" and op == 0:
+            nombre, largo = struct.unpack("<II", b[:8])
+            interfaz = b[8:8 + largo - 1].decode()
+            version = struct.unpack("<I", b[8 + ((largo + 3) & ~3):][:4])[0]
+            self.globales.setdefault(interfaz, []).append((nombre, version))
+        elif tipo == "sync:globales":
+            faltan = [i for i in ("wl_compositor", "wl_shm", "wl_seat", "wl_output",
+                                  "zwlr_layer_shell_v1", "wp_viewporter",
+                                  "ext_image_copy_capture_manager_v1",
+                                  "ext_output_image_capture_source_manager_v1")
+                      if i not in self.globales]
+            if faltan:
+                log("foco: el compositor no tiene", ", ".join(faltan))
+                self.detener()
+                return
+            for nombre, _v in self.globales["wl_output"]:
+                self.salidas[self._enlazar("wl_output", 4, nombre)] = None
+            self._sync("salidas")
+        elif tipo == "wl_output" and op == 4:
+            largo = struct.unpack("<I", b[:4])[0]
+            self.salidas[obj] = b[4:4 + largo - 1].decode()
+        elif tipo == "sync:salidas":
+            self._crear()
+        elif tipo == "capa":
+            if op == 0:
+                serie, ancho, alto = struct.unpack("<III", b)
+                self._enviar(obj, 6, struct.pack("<I", serie))
+                self._buferes(ancho, alto)
+            elif op == 1:
+                self.detener()
+        elif tipo == "cuadro":
+            self.cuadro = False
+            if self.sucio:
+                self._pintar()
+        elif tipo == "buffer" and op == 0:
+            for bb in self.bufs:
+                if bb["id"] == obj:
+                    bb["ocupado"] = False
+            if self.sucio and not self.cuadro:
+                self._pintar()
+        elif tipo == "cursor" and op == 2:
+            # al salir de la salida (al pad) el foco se queda donde estaba
+            pos = struct.unpack("<ii", b)
+            if pos != self.pos:
+                self.pos = pos
+                self.quieto = 0
+                self._pedir_cuadro()
+        elif tipo == "captura":
+            if op == 0:
+                self.tam_cursor = struct.unpack("<II", b)
+            elif op == 1 and self.formato is None:
+                self.formato = struct.unpack("<I", b)[0]
+            elif op == 4:
+                self._buffer_cursor()
+                if not self.frame:
+                    self._capturar()
+            elif op == 5:
+                self.detener()
+        elif tipo == "frame" and op in (3, 4):
+            self._enviar(obj, 0)
+            self.frame = None
+            # si falla, el compositor manda otro "done" con los límites nuevos o se reintenta
+            self.quieto += 1
+            pausa = CAPTURA_QUIETO_MS if self.quieto > QUIETO else CAPTURA_MS
+            self.espera = GLib.timeout_add(pausa if op == 3 else 500, self._capturar)
+
+    # ----- capa del oscurecido ----------------------------------------------
+
+    def _crear(self):
+        self.salida = next((o for o, n in self.salidas.items() if n == self.conector), None)
+        if self.salida is None:
+            log(f"foco: no está la salida {self.conector}")
+            self.detener()
+            return
+        compositor = self._enlazar("wl_compositor", 4)
+        self.shm = self._enlazar("wl_shm", 1)
+        capas = self._enlazar("zwlr_layer_shell_v1", 4)
+        vistas = self._enlazar("wp_viewporter", 1)
+        self.superficie = self._nuevo("superficie")
+        self._enviar(compositor, 0, struct.pack("<I", self.superficie))
+        region = self._nuevo("region")
+        self._enviar(compositor, 1, struct.pack("<I", region))
+        # región de entrada vacía: los clics pasan a la presentación
+        self._enviar(self.superficie, 5, struct.pack("<I", region))
+        self._enviar(region, 0)
+        self.vista = self._nuevo("vista")
+        self._enviar(vistas, 1, struct.pack("<II", self.vista, self.superficie))
+        capa = self._nuevo("capa")
+        self._enviar(capas, 0, struct.pack("<IIII", capa, self.superficie, self.salida, 3)
+                     + self._texto("glasspad-foco"))
+        self._enviar(capa, 1, struct.pack("<I", 15))         # los cuatro bordes
+        self._enviar(capa, 2, struct.pack("<i", -1))
+        self._enviar(capa, 4, struct.pack("<I", 0))          # sin teclado
+        self._enviar(self.superficie, 6)
+
+        asiento = self._enlazar("wl_seat", 5)
+        fuentes = self._enlazar("ext_output_image_capture_source_manager_v1", 1)
+        capturas = self._enlazar("ext_image_copy_capture_manager_v1", 1)
+        puntero = self._nuevo("wl_pointer")
+        self._enviar(asiento, 0, struct.pack("<I", puntero))
+        fuente = self._nuevo("fuente")
+        self._enviar(fuentes, 0, struct.pack("<II", fuente, self.salida))
+        cursor = self._nuevo("cursor")
+        self._enviar(capturas, 1, struct.pack("<III", cursor, fuente, puntero))
+        self.sesion = self._nuevo("captura")
+        self._enviar(cursor, 1, struct.pack("<I", self.sesion))
+
+    def _buferes(self, ancho, alto):
+        w, h = max(1, round(ancho * self.escala)), max(1, round(alto * self.escala))
+        if self.bufs and (self.w, self.h) == (w, h):
+            return
+        self.w, self.h = w, h
+        for bb in self.bufs:
+            self._enviar(bb["id"], 0)
+        if self.mapa:
+            self._enviar(self.pool, 1)
+            self.mapa.close()
+        paso = w * 4
+        tam = paso * h
+        fd = os.memfd_create("glasspad-foco", os.MFD_CLOEXEC)
+        os.ftruncate(fd, 2 * tam)
+        self.mapa = mmap.mmap(fd, 2 * tam)
+        self.pool = self._nuevo("pool")
+        self._enviar(self.shm, 0, struct.pack("<Ii", self.pool, 2 * tam), fd=fd)
+        os.close(fd)
+        self.bufs = []
+        for i in range(2):
+            ident = self._nuevo("buffer")
+            # formato 0: ARGB8888 premultiplicado, igual que cairo
+            self._enviar(self.pool, 0, struct.pack("<IiiiiI", ident, i * tam, w, h, paso, 0))
+            sup = cairo.ImageSurface.create_for_data(
+                memoryview(self.mapa)[i * tam:(i + 1) * tam], cairo.FORMAT_ARGB32, w, h, paso)
+            self.bufs.append({"id": ident, "sup": sup, "ocupado": False, "completo": True,
+                              "caja": None})
+        self._enviar(self.vista, 2, struct.pack("<ii", ancho, alto))
+        self.mostrada = None
+        self.sucio = True
+        self._pintar()
+
+    def _pedir_cuadro(self):
+        self.sucio = True
+        if not self.cuadro:
+            self._pintar()
+
+    def _lado(self):
+        return math.ceil((self.ajustes["radio"] + self.BORDE + self.ANILLO + 2) * self.escala)
+
+    def _centro(self):
+        x, y = self.pos or (self.w / 2, self.h / 2)
+        return round(x), round(y)
+
+    def _caja(self):
+        x, y = self._centro()
+        lado = self._lado()
+        x0, y0 = max(0, x - lado), max(0, y - lado)
+        x1, y1 = min(self.w, x + lado), min(self.h, y + lado)
+        return x0, y0, max(x0, x1), max(y0, y1)
+
+    def _oscuro(self):
+        return (0.03, 0.04, 0.06, self.ajustes["oscuro"] / 100)
+
+    def _circulo(self):
+        """El cuadrado con el círculo, dibujado una vez por cada combinación de ajustes."""
+        e = self.ajustes
+        clave = (e["radio"], e["oscuro"], e["anillo"], self.escala)
+        if self.sello and self.sello[0] == clave:
+            return self.sello[1]
+        lado = self._lado()
+        sup = cairo.ImageSurface(cairo.FORMAT_ARGB32, 2 * lado, 2 * lado)
+        cr = cairo.Context(sup)
+        oscuro = self._oscuro()
+        r, borde = e["radio"] * self.escala, self.BORDE * self.escala
+        g = cairo.RadialGradient(lado, lado, max(0, r - borde), lado, lado, r + borde)
+        g.add_color_stop_rgba(0, *oscuro[:3], 0)
+        g.add_color_stop_rgba(1, *oscuro)
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source(g)
+        cr.paint()
+        if e["anillo"]:
+            cr.set_operator(cairo.OPERATOR_OVER)
+            cr.arc(lado, lado, r, 0, 2 * math.pi)
+            cr.set_source_rgba(0.96, 0.78, 0.30, 0.65)
+            cr.set_line_width(self.ANILLO * self.escala)
+            cr.stroke()
+        sup.flush()
+        self.sello = (clave, sup)
+        return sup
+
+    def _pintar(self):
+        if not self.s or not self.bufs:
+            return
+        libres = [bb for bb in self.bufs if not bb["ocupado"]]
+        if not libres:
+            return          # se pinta cuando el compositor suelte uno
+        bb = libres[0]
+        self.sucio = False
+        caja = self._caja()
+        completo = bb["completo"] or bb["caja"] is None
+        cr = cairo.Context(bb["sup"])
+        if not completo:
+            for x0, y0, x1, y1 in (bb["caja"], caja):
+                cr.rectangle(x0, y0, x1 - x0, y1 - y0)
+            cr.clip()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(*self._oscuro())
+        cr.paint()
+        x, y = self._centro()
+        lado = self._lado()
+        cr.set_source_surface(self._circulo(), x - lado, y - lado)
+        cr.rectangle(caja[0], caja[1], caja[2] - caja[0], caja[3] - caja[1])
+        cr.fill()
+        bb["sup"].flush()
+        bb["completo"] = False
+        bb["caja"] = caja
+        bb["ocupado"] = True
+
+        self._enviar(self.superficie, 1, struct.pack("<Iii", bb["id"], 0, 0))
+        if completo or self.mostrada is None:
+            danos = [(0, 0, self.w, self.h)]
+        else:
+            danos = [self.mostrada, caja]
+        for x0, y0, x1, y1 in danos:
+            self._enviar(self.superficie, 9, struct.pack("<iiii", x0, y0, x1 - x0, y1 - y0))
+        self.cuadro = True
+        self._enviar(self.superficie, 3, struct.pack("<I", self._nuevo("cuadro")))
+        self._enviar(self.superficie, 6)
+        self.mostrada = caja
+
+    # ----- cursor ------------------------------------------------------------
+
+    def _buffer_cursor(self):
+        if self.buffer_cursor:
+            self._enviar(self.buffer_cursor, 0)
+            self._enviar(self.pool_cursor, 1)
+        w, h = self.tam_cursor
+        tam = max(4, w * h * 4)
+        fd = os.memfd_create("glasspad-cursor", os.MFD_CLOEXEC)
+        os.ftruncate(fd, tam)
+        self.pool_cursor = self._nuevo("pool")
+        self._enviar(self.shm, 0, struct.pack("<Ii", self.pool_cursor, tam), fd=fd)
+        os.close(fd)
+        self.buffer_cursor = self._nuevo("buffer-cursor")
+        self._enviar(self.pool_cursor, 0, struct.pack("<IiiiiI", self.buffer_cursor, 0, w, h,
+                                                      w * 4, self.formato or 0))
+
+    def _capturar(self):
+        self.espera = 0
+        if not self.s or not self.buffer_cursor:
+            return False
+        self.frame = self._nuevo("frame")
+        self._enviar(self.sesion, 0, struct.pack("<I", self.frame))
+        self._enviar(self.frame, 1, struct.pack("<I", self.buffer_cursor))
+        w, h = self.tam_cursor
+        self._enviar(self.frame, 2, struct.pack("<iiii", 0, 0, w, h))
+        self._enviar(self.frame, 3)
+        return False
 
 
 class Trazo:
@@ -283,6 +700,8 @@ class Pizarra(Gtk.Application):
         self.tic = 0
         self.espera_aviso = 0
         self.conexion = None
+        self.foco = None
+        self.achicada = False
 
     # ----- arranque ----------------------------------------------------------
 
@@ -318,13 +737,18 @@ class Pizarra(Gtk.Application):
         GLib.timeout_add(500, self._revisar_monitor)
 
     def _revisar_monitor(self):
-        if self.ventana and self.ventana.get_visible():
-            m = monitor_principal()
-            if m and m != Capa.get_monitor(self.ventana):
-                debug("monitor principal:", m.get_connector())
-                self.ventana.destroy()
-                self.ventana = None
-                self._actualizar()
+        m = monitor_principal()
+        if not m:
+            return False
+        if self.ventana and m != Capa.get_monitor(self.ventana):
+            debug("monitor principal:", m.get_connector())
+            self.ventana.destroy()
+            self.ventana = None
+            self.achicada = False
+            self._actualizar()
+        if self.foco and self.foco.conector != m.get_connector():
+            self._seguir_cursor(False)
+            self._seguir_cursor(True)
         return False
 
     # ----- D-Bus -------------------------------------------------------------
@@ -351,7 +775,7 @@ class Pizarra(Gtk.Application):
                 self.paginas[f] = []
                 self.historial[f] = []
             self.lasers = []
-            self._ajustar({"escribir": False})
+            self._ajustar({"escribir": False, "foco": False})
         elif metodo == "CambioDiapositiva":
             if self.estado["borrar_al_pasar"] and self.paginas["transparente"]:
                 self._guardar_historial("transparente")
@@ -383,9 +807,27 @@ class Pizarra(Gtk.Application):
                 log(f"no se pudo guardar {ESTADO}: {e}")
         aviso = self.estado["escribir"] and (not antes["escribir"] or any(
             self.estado[k] != antes[k] for k in ("herramienta", "color", "fondo")))
+        if self.estado["foco"] != antes["foco"]:
+            self._seguir_cursor(self.estado["foco"])
+        elif self.foco and any(self.estado[k] != antes[k] for k in ("radio", "oscuro", "anillo")):
+            self.foco.repintar()
         self._cambio()
         if aviso:
             self._mostrar_aviso()
+
+    # ----- foco --------------------------------------------------------------
+
+    def _seguir_cursor(self, si):
+        if not si:
+            if self.foco:
+                self.foco.detener()
+                self.foco = None
+            return
+        m = monitor_principal()
+        if m and not self.foco:
+            escala = m.get_scale() if hasattr(m, "get_scale") else m.get_scale_factor()
+            self.foco = Foco(m.get_connector(), escala, self.estado)
+            self.foco.iniciar()
 
     # ----- páginas e historial ----------------------------------------------
 
@@ -415,7 +857,8 @@ class Pizarra(Gtk.Application):
     # ----- ventana -----------------------------------------------------------
 
     def _necesita_ventana(self):
-        return self.estado["escribir"] or bool(self.paginas["transparente"]) or bool(self.lasers)
+        return (self.estado["escribir"] or bool(self.lasers)
+                or bool(self.paginas["transparente"]))
 
     def _crear_ventana(self):
         m = monitor_principal()
@@ -457,26 +900,38 @@ class Pizarra(Gtk.Application):
 
     def _actualizar(self):
         """Muestra u oculta la capa y decide si toma el mouse."""
-        if not self._necesita_ventana():
-            if self.ventana and self.ventana.get_visible():
-                self.ventana.set_visible(False)
-            return
         if self.ventana is None:
+            if not self._necesita_ventana():
+                return
             self._crear_ventana()
-        if not self.ventana.get_visible():
             self.ventana.present()
+        self._achicar(not self._necesita_ventana())
         self._region()
         self.area.set_cursor_from_name(
             ("cell" if self.estado["herramienta"] == "borrador" else "crosshair")
             if self.estado["escribir"] else None)
         self.area.queue_draw()
 
+    def _achicar(self, si):
+        """1x1 y al fondo cuando no se usa: COSMIC corta la conexión al ocultar la capa."""
+        v = self.ventana
+        if si == self.achicada:
+            return
+        self.achicada = si
+        Capa.set_anchor(v, Capa.Edge.BOTTOM, not si)
+        Capa.set_anchor(v, Capa.Edge.RIGHT, not si)
+        Capa.set_layer(v, Capa.Layer.BACKGROUND if si else Capa.Layer.OVERLAY)
+        v.set_default_size(1, 1)
+        if si:
+            self.cache = None
+
     def _region(self):
         superficie = self.ventana.get_surface() if self.ventana else None
         if superficie is None:
             return
         # región vacía: los clics pasan a la ventana de abajo
-        superficie.set_input_region(None if self.estado["escribir"] else cairo.Region())
+        toma = self.estado["escribir"] and not self.achicada
+        superficie.set_input_region(None if toma else cairo.Region())
 
     def _mostrar_aviso(self):
         if not self.ventana:
@@ -500,12 +955,15 @@ class Pizarra(Gtk.Application):
 
     def _ocultar_aviso(self):
         self.espera_aviso = 0
-        self.aviso.set_reveal_child(False)
+        if self.ventana:
+            self.aviso.set_reveal_child(False)
         return False
 
     # ----- dibujo ------------------------------------------------------------
 
     def _dibujar(self, area, cr, ancho, alto):
+        if self.achicada:
+            return
         pagina = self._pagina()
         cr.set_operator(cairo.OPERATOR_SOURCE)
         fondo = FONDOS[pagina]
@@ -515,8 +973,9 @@ class Pizarra(Gtk.Application):
             cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
-        cr.set_source_surface(self._cache(pagina, ancho, alto), 0, 0)
-        cr.paint()
+        if self.paginas[pagina]:
+            cr.set_source_surface(self._cache(pagina, ancho, alto), 0, 0)
+            cr.paint()
         if self.actual and self.actual.herramienta != "laser":
             self.actual.dibujar(cr)
         ahora = time.monotonic()
