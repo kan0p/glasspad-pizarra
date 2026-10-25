@@ -71,6 +71,20 @@ Los nombres de los signos siguen la distribución de teclado de COSMIC (`us`, `l
 
 Los ajustes se guardan en `~/.local/state/glasspad/pizarra.json`.
 
+## Atajos de teclado
+
+El botón ⚙ junto a **Apagar todo** muestra los atajos de la Pizarra:
+
+| Atajo | Acción |
+|---|---|
+| Super+Alt+E | Escribir |
+| Super+Alt+F | Foco |
+| Super+Alt+T | Teclas |
+| Super+Alt+Z | Deshacer |
+| Super+Alt+0 | Apagar todo |
+
+**Registrar en COSMIC** los agrega a los atajos propios de COSMIC (`~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom`) sin tocar los demás, y **Quitar de COSMIC** los saca. Para cambiar uno, se toca **Cambiar** y se pulsa la combinación nueva en el teclado: la lee el lector de Teclas, así que necesita la parte del sistema. Si COSMIC u otra acción de la Pizarra ya la usan, avisa y no la guarda. **Restablecer** vuelve a los de la tabla.
+
 ## Desde la terminal
 
 ```sh

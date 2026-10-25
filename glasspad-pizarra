@@ -54,7 +54,7 @@ if LIB_LAYER not in os.environ.get("LD_PRELOAD", ""):
 # todo se dibuja con cairo en memoria: sin texturas nuevas de GSK en cada cuadro
 os.environ.setdefault("GSK_RENDERER", "cairo")
 
-import array, json, math, mmap, socket, struct, time
+import array, json, math, mmap, re, socket, struct, time
 
 import cairo
 import gi
@@ -103,9 +103,10 @@ QUIETO = 30                 # capturas sin movimiento para pasar a CAPTURA_QUIET
 PREDETERMINADO = {"escribir": False, "herramienta": "lapiz", "color": "rojo", "grosor": 2,
                   "fondo": "transparente", "borrar_al_pasar": True,
                   "foco": False, "radio": 160, "oscuro": 70, "anillo": True, "clics": True,
-                  "teclas": False, "windows": True, "posicion": "centro", "tamano": "m"}
+                  "teclas": False, "windows": True, "posicion": "centro", "tamano": "m",
+                  "atajos": {}}
 GUARDADOS = ("herramienta", "color", "grosor", "fondo", "borrar_al_pasar",
-             "radio", "oscuro", "anillo", "clics", "windows", "posicion", "tamano")
+             "radio", "oscuro", "anillo", "clics", "windows", "posicion", "tamano", "atajos")
 POSICIONES = ("centro", "derecha")
 TAMANOS = {"s": 0.8, "m": 1.0, "l": 1.3}
 
@@ -117,6 +118,10 @@ XML = f"""
     <method name="Borrar"/>
     <method name="ApagarTodo"/>
     <method name="CambioDiapositiva"/>
+    <method name="CapturarAtajo"><arg type="s" name="accion" direction="in"/></method>
+    <method name="CancelarCaptura"/>
+    <method name="RegistrarAtajos"><arg type="b" name="si" direction="in"/></method>
+    <method name="RestablecerAtajos"/>
     <method name="Estado"><arg type="a{{sv}}" name="estado" direction="out"/></method>
     <signal name="Cambio"><arg type="a{{sv}}" name="estado"/></signal>
     <signal name="Aviso"><arg type="s" name="texto"/></signal>
@@ -205,10 +210,15 @@ def valido(clave, valor):
             "windows": lambda v: isinstance(v, bool),
             "clics": lambda v: isinstance(v, bool),
             "posicion": lambda v: v in POSICIONES,
-            "tamano": lambda v: v in TAMANOS}.get(clave, lambda v: False)(valor)
+            "tamano": lambda v: v in TAMANOS,
+            "atajos": lambda v: isinstance(v, dict) and all(
+                k in ACCIONES and isinstance(a, str) and a for k, a in v.items()),
+            }.get(clave, lambda v: False)(valor)
 
 
 def variante(v):
+    if isinstance(v, dict):
+        return GLib.Variant("a{ss}", {str(k): str(a) for k, a in v.items()})
     if isinstance(v, bool):
         return GLib.Variant("b", v)
     if isinstance(v, int):
@@ -780,6 +790,64 @@ for _n in range(1, 10):
     EQUIVALENCIAS[f"super+shift+{_n}"] = (f"Mover la ventana al espacio {_n}", None)
 
 
+COSMIC_ATAJOS = "/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/defaults"
+COSMIC_PROPIOS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                              "cosmic", "com.system76.CosmicSettings.Shortcuts", "v1", "custom")
+# acción -> (nombre, argumentos de glasspad-pizarra)
+ACCIONES = {"escribir": ("Escribir", "alternar escribir"), "foco": ("Foco", "alternar foco"),
+            "teclas": ("Teclas", "alternar teclas"), "deshacer": ("Deshacer", "deshacer"),
+            "apagar": ("Apagar todo", "apagar")}
+ATAJOS_INICIALES = {"escribir": "super+alt+e", "foco": "super+alt+f", "teclas": "super+alt+t",
+                    "deshacer": "super+alt+z", "apagar": "super+alt+0"}
+CAPTURA_S = 10
+# nombre de tecla propio <-> keysym de COSMIC
+KEYSYMS = {"left": "Left", "right": "Right", "up": "Up", "down": "Down", "escape": "Escape",
+           "tab": "Tab", "enter": "Return", "backspace": "BackSpace", "delete": "Delete",
+           "home": "Home", "end": "End", "pageup": "Page_Up", "pagedown": "Page_Down",
+           "insert": "Insert", "print": "Print"}
+DE_KEYSYM = {v.lower(): k for k, v in KEYSYMS.items()}
+RE_ATAJO_COSMIC = re.compile(r'\(\s*modifiers:\s*\[([^\]]*)\]\s*(?:,\s*key:\s*"([^"]*)")?\s*\)'
+                             r'\s*:\s*([^\n]*?),?\s*$', re.M)
+
+
+def normalizar(atajo):
+    """'alt+Super+E' -> 'super+alt+e': mismo orden de modificadores que el lector."""
+    partes = [p.strip().lower() for p in atajo.split("+") if p.strip()]
+    mods = [m for m in MODS_ORDEN if m in partes]
+    resto = [DE_KEYSYM.get(p, p) for p in partes if p not in MODS_ORDEN]
+    return "+".join(mods + resto[-1:])
+
+
+def atajos_cosmic(texto):
+    """{atajo normalizado: acción} de un archivo de atajos de COSMIC."""
+    salida = {}
+    for mods, tecla, accion in RE_ATAJO_COSMIC.findall(texto):
+        partes = [m.strip() for m in mods.split(",") if m.strip()]
+        if tecla:
+            partes.append(tecla)
+        salida[normalizar("+".join(partes))] = accion.strip()
+    return salida
+
+
+def leer(ruta):
+    try:
+        with open(ruta) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def entrada_cosmic(atajo, programa, args):
+    partes = atajo.split("+")
+    mods = ", ".join(m.capitalize() for m in partes[:-1])
+    tecla = partes[-1]
+    if tecla in MODS_ORDEN:
+        mods = ", ".join(m.capitalize() for m in partes)
+        return f'    (modifiers: [{mods}]): Spawn("{programa} {args}"),\n'
+    tecla = KEYSYMS.get(tecla, tecla.upper() if re.fullmatch(r"f\d+", tecla) else tecla)
+    return f'    (modifiers: [{mods}], key: "{tecla}"): Spawn("{programa} {args}"),\n'
+
+
 def distribucion():
     """La primera distribución de COSMIC; si no se puede leer, us."""
     try:
@@ -998,8 +1066,13 @@ class Tarjetas:
             self.caja.remove(viva["caja"])
 
     def vaciar(self):
+        # desvanecer en vez de quitar: COSMIC no vuelve a pedir un cuadro al achicarse la capa,
+        # así que el último dibujado debe ser transparente
         for viva in list(self.vivas):
-            self._quitar(viva)
+            if not viva["saliendo"]:
+                if viva["espera"]:
+                    GLib.source_remove(viva["espera"])
+                self._desvanecer(viva)
 
 
 class Trazo:
@@ -1095,6 +1168,8 @@ class Pizarra(Gtk.Application):
         self.tarjetas = Tarjetas(self)
         self.signos = SIGNOS["us"]
         self.sin_lector = False     # el lector falló: no se reintenta hasta que se pida otra vez
+        self.capturando = None      # acción cuyo atajo se está esperando
+        self.espera_captura = 0
 
     # ----- arranque ----------------------------------------------------------
 
@@ -1169,6 +1244,18 @@ class Pizarra(Gtk.Application):
                 self.historial[f] = []
             self.lasers = []
             self._ajustar({"escribir": False, "foco": False, "teclas": False})
+        elif metodo == "CapturarAtajo":
+            accion = params.unpack()[0]
+            if accion not in ACCIONES:
+                invocacion.return_dbus_error(f"{INTERFAZ}.Error.Invalido", "acción desconocida")
+                return
+            self._capturar(accion)
+        elif metodo == "CancelarCaptura":
+            self._fin_captura()
+        elif metodo == "RegistrarAtajos":
+            self._registrar(params.unpack()[0])
+        elif metodo == "RestablecerAtajos":
+            self._guardar_atajos({})
         elif metodo == "CambioDiapositiva":
             if self.estado["borrar_al_pasar"] and self.paginas["transparente"]:
                 self._guardar_historial("transparente")
@@ -1181,6 +1268,9 @@ class Pizarra(Gtk.Application):
         pagina = self._pagina()
         d["puede_deshacer"] = variante(bool(self.historial[pagina]))
         d["hay_dibujo"] = variante(any(self.paginas.values()))
+        d["atajos"] = variante(self._atajos())
+        d["atajos_registrados"] = variante(self._registrados())
+        d["capturando"] = variante(self.capturando or "")
         return d
 
     def _cambio(self):
@@ -1212,22 +1302,122 @@ class Pizarra(Gtk.Application):
             self.tarjetas.reubicar()
         if any(cambios.get(k) is True for k in ("teclas", "foco", "clics")):
             self.sin_lector = False
-        if not self.sin_lector and (self.estado["teclas"]
-                                    or (self.estado["foco"] and self.estado["clics"])):
-            self.lector.encender()
-        else:
-            self.lector.apagar()
+        self._lector_segun_estado()
         self._cambio()
         if aviso:
             self._mostrar_aviso()
 
     # ----- teclas ------------------------------------------------------------
 
+    def _lector_segun_estado(self):
+        if not self.sin_lector and (self.capturando or self.estado["teclas"]
+                                    or (self.estado["foco"] and self.estado["clics"])):
+            self.lector.encender()
+        else:
+            self.lector.apagar()
+
+    # ----- atajos de la Pizarra en COSMIC ------------------------------------
+
+    def _atajos(self):
+        return {**ATAJOS_INICIALES, **self.estado["atajos"]}
+
+    def _programa(self):
+        return os.path.realpath(sys.argv[0])
+
+    def _registrados(self):
+        return "glasspad-pizarra " in leer(COSMIC_PROPIOS)
+
+    def _capturar(self, accion):
+        self._fin_captura(avisar=False)
+        self.capturando = accion
+        self.sin_lector = False
+        self._lector_segun_estado()
+        self.espera_captura = GLib.timeout_add_seconds(CAPTURA_S, self._fin_captura)
+        self._cambio()
+
+    def _fin_captura(self, avisar=True):
+        if self.espera_captura:
+            GLib.source_remove(self.espera_captura)
+            self.espera_captura = 0
+        if self.capturando:
+            self.capturando = None
+            self._lector_segun_estado()
+            if avisar:
+                self._cambio()
+        return False
+
+    def _capturado(self, atajo):
+        accion = self.capturando
+        nombre = ACCIONES[accion][0]
+        partes = atajo.split("+")
+        if not set(partes[:-1]) & {"super", "ctrl", "alt"} and atajo != "super":
+            self._avisar("El atajo necesita Super, Ctrl o Alt")
+            return
+        if atajo == "super":
+            self._avisar("Super solo abre el lanzador de COSMIC")
+            return
+        propios = {a: k for k, a in self._atajos().items() if k != accion}
+        if atajo in propios:
+            self._avisar(f"Ya lo usa {ACCIONES[propios[atajo]][0]} de la Pizarra")
+            return
+        ocupados = atajos_cosmic(leer(COSMIC_ATAJOS))
+        ocupados.update({a: x for a, x in atajos_cosmic(leer(COSMIC_PROPIOS)).items()
+                         if "glasspad-pizarra " not in x})
+        if atajo in ocupados:
+            self._avisar(" + ".join(etiquetas(atajo, False)) + " ya tiene un atajo en COSMIC")
+            return
+        self._fin_captura(avisar=False)
+        self._guardar_atajos({**self.estado["atajos"], accion: atajo})
+        self._avisar(f"{nombre}: " + " + ".join(etiquetas(atajo, False)))
+
+    def _guardar_atajos(self, atajos):
+        registrados = self._registrados()
+        self._ajustar({"atajos": {k: a for k, a in atajos.items() if ATAJOS_INICIALES[k] != a}})
+        if registrados:
+            self._registrar(True)
+
+    def _registrar(self, si):
+        """Pone o quita las entradas de la Pizarra en los atajos propios de COSMIC."""
+        texto = leer(COSMIC_PROPIOS)
+        lineas = [l for l in texto.splitlines(keepends=True) if "glasspad-pizarra " not in l]
+        cuerpo = "".join(lineas).rstrip()
+        if cuerpo.endswith("}"):
+            cuerpo = cuerpo[:-1].rstrip()
+        else:
+            cuerpo = "{"
+        if si:
+            if not cuerpo.endswith(",") and not cuerpo.endswith("{"):
+                cuerpo += ","
+            programa = self._programa()
+            cuerpo += "\n" + "".join(entrada_cosmic(a, programa, ACCIONES[k][1])
+                                     for k, a in self._atajos().items())
+        nuevo = cuerpo.rstrip() + "\n}\n"
+        try:
+            os.makedirs(os.path.dirname(COSMIC_PROPIOS), exist_ok=True)
+            tmp = COSMIC_PROPIOS + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(nuevo)
+            os.replace(tmp, COSMIC_PROPIOS)
+        except OSError as e:
+            self._avisar(f"No se pudieron guardar los atajos: {e.strerror}")
+        self._cambio()
+
+    def _avisar(self, texto):
+        if self.conexion:
+            self.conexion.emit_signal(None, RUTA, INTERFAZ, "Aviso", GLib.Variant("(s)", (texto,)))
+
     def _atajo(self, texto):
+        atajo = "+".join(nombre_tecla(p, self.signos) for p in texto.split("+"))
+        if self.capturando:
+            self._capturado(atajo)
+            return
         if not self.estado["teclas"]:
             return
-        atajo = "+".join(nombre_tecla(p, self.signos) for p in texto.split("+"))
-        descripcion, windows = EQUIVALENCIAS.get(atajo, (None, None))
+        propios = {a: k for k, a in self._atajos().items()}
+        if atajo in propios:
+            descripcion, windows = "Pizarra: " + ACCIONES[propios[atajo]][0], None
+        else:
+            descripcion, windows = EQUIVALENCIAS.get(atajo, (None, None))
         self.tarjetas.mostrar(atajo, descripcion, windows)
 
     def _clic(self, boton):
@@ -1237,8 +1427,8 @@ class Pizarra(Gtk.Application):
     def _fallo_lector(self, texto):
         log("teclas:", texto)
         self.sin_lector = True
-        if self.conexion:
-            self.conexion.emit_signal(None, RUTA, INTERFAZ, "Aviso", GLib.Variant("(s)", (texto,)))
+        self._avisar(texto)
+        GLib.idle_add(lambda: self._fin_captura() and False)
         # puede llegar desde dentro de _ajustar
         GLib.idle_add(lambda: self.estado["teclas"] and self._ajustar({"teclas": False}) and False)
 

@@ -20,6 +20,13 @@ FONDOS = [("transparente", "Sobre la diapositiva"), ("blanca", "Pizarra blanca")
 NOMBRE_HERRAMIENTA = dict(HERRAMIENTAS) | {"resaltador": "Resaltador"}
 ACENTOS = {"escribir": "#ff8a3d", "foco": "#f5c84c", "teclas": "#6aa8ff"}
 ENVIAR_MS = 40      # mientras se arrastra una barra, un ajuste cada tanto
+ACCIONES = [("escribir", "Escribir"), ("foco", "Foco"), ("teclas", "Teclas"),
+            ("deshacer", "Deshacer"), ("apagar", "Apagar todo")]
+NOMBRES_TECLAS = {"super": "Super", "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift",
+                  "left": "←", "right": "→", "up": "↑", "down": "↓", "escape": "Esc",
+                  "tab": "Tab", "space": "Espacio", "enter": "Enter", "delete": "Supr",
+                  "pageup": "RePág", "pagedown": "AvPág", "home": "Inicio", "end": "Fin",
+                  "minus": "-", "plus": "+", "period": ".", "comma": ",", "ntilde": "Ñ"}
 
 CSS = """
 .pizarra { margin: 36px 77px 30px 77px; }
@@ -59,6 +66,19 @@ CSS = """
                 box-shadow: none; outline: none; border-radius: 30px; color: white;
                 font-size: 24px; padding: 10px 26px; }
 .pizarra-chip.presionado { background: alpha(white, 0.25); }
+.pizarra-boton.engranaje { min-width: 88px; padding: 0; }
+.pizarra-velo { background: alpha(black, 0.55); border: none; box-shadow: none; outline: none;
+                border-radius: 0; }
+.pizarra-hoja { background: #141b2b; border: 1px solid alpha(white, 0.1); border-radius: 50px;
+                padding: 40px 50px; min-width: 1300px; }
+.pizarra-fila-atajo { min-height: 96px; }
+.pizarra-fila-atajo .nombre { font-size: 30px; font-weight: 600; min-width: 280px; }
+.pizarra-tecla-pad { background: #2b3040; border-radius: 14px; border-bottom: 5px solid #0c0e13;
+                     padding: 8px 20px; font-size: 28px; font-weight: 600; }
+.pizarra-mas-pad { color: alpha(white, 0.5); font-size: 28px; }
+.pizarra-esperando { font-size: 28px; color: #6aa8ff; }
+.pizarra-estado-atajos { font-size: 24px; color: alpha(white, 0.65); }
+.pizarra-boton.principal { background: #4d9bff; border-color: #4d9bff; }
 """ + "".join(f".pizarra-color.{n} {{ background: {c}; }}\n" for n, c in COLORES) + "".join(f"""
 .pizarra-mosaico.{h}.elegido {{ border-color: {c}; }}
 .pizarra-mosaico.{h} .pizarra-interruptor.encendido {{ background: {c}; }}
@@ -201,6 +221,7 @@ def crear(api):
     cabecera.append(boton(None, "anterior", lambda: pasar("Left"), ["flecha"]))
     cabecera.append(boton(None, "siguiente", lambda: pasar("Right"), ["flecha"]))
     cabecera.append(boton("Apagar todo", "apagar", lambda: llamar("ApagarTodo")))
+    cabecera.append(boton(None, "ajustes", lambda: abrir_hoja(True), ["engranaje"]))
 
     # ----- mosaicos ----------------------------------------------------------
 
@@ -365,11 +386,84 @@ def crear(api):
         for clave, poner in barras.items():
             if clave in estado:
                 poner(estado[clave])
+        mostrar_atajos()
 
-    api.al_mostrar(lambda visible: visible and refrescar())
+    # ----- atajos de teclado ------------------------------------------------
+
+    def teclas_de(atajo):
+        caja = Gtk.Box(spacing=10, valign=Gtk.Align.CENTER)
+        for i, p in enumerate(atajo.split("+")):
+            if i:
+                caja.append(Gtk.Label(label="+", css_classes=["pizarra-mas-pad"]))
+            texto = NOMBRES_TECLAS.get(p, p.upper() if len(p) <= 3 else p.capitalize())
+            caja.append(Gtk.Label(label=texto, css_classes=["pizarra-tecla-pad"]))
+        return caja
+
+    hoja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, css_classes=["pizarra-hoja"],
+                   halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+    arriba = Gtk.Box(spacing=16)
+    arriba.append(Gtk.Label(label="Atajos de teclado", css_classes=["pizarra-titulo"], xalign=0,
+                            hexpand=True))
+    arriba.append(boton(None, "cerrar", lambda: abrir_hoja(False), ["engranaje"]))
+    hoja.append(arriba)
+    filas = {}
+    for clave, nombre in ACCIONES:
+        f = Gtk.Box(spacing=24, css_classes=["pizarra-fila-atajo"])
+        f.append(Gtk.Label(label=nombre, css_classes=["nombre"], xalign=0))
+        lugar = Gtk.Box(hexpand=True)
+        f.append(lugar)
+        cambiar = boton("Cambiar", None, lambda c=clave: (
+            llamar("CancelarCaptura") if estado.get("capturando") == c
+            else llamar("CapturarAtajo", GLib.Variant("(s)", (c,)))))
+        f.append(cambiar)
+        filas[clave] = (lugar, cambiar)
+        hoja.append(f)
+    abajo = Gtk.Box(spacing=16, margin_top=12)
+    estado_atajos = Gtk.Label(css_classes=["pizarra-estado-atajos"], xalign=0, hexpand=True,
+                              wrap=True)
+    abajo.append(estado_atajos)
+    abajo.append(boton("Restablecer", None, lambda: llamar("RestablecerAtajos")))
+    registrar = boton("Registrar en COSMIC", None, lambda: llamar(
+        "RegistrarAtajos", GLib.Variant("(b)", (not estado.get("atajos_registrados", False),))))
+    abajo.append(registrar)
+    hoja.append(abajo)
+    velo = api.accion(Gtk.Button(css_classes=["pizarra-velo"]), lambda: abrir_hoja(False))
+    capa_hoja = Gtk.Overlay(child=velo, visible=False)
+    capa_hoja.add_overlay(hoja)
+
+    def abrir_hoja(si):
+        if not si and estado.get("capturando"):
+            llamar("CancelarCaptura")
+        capa_hoja.set_visible(si)
+        if si:
+            refrescar()
+
+    def mostrar_atajos():
+        atajos = estado.get("atajos", {})
+        capturando = estado.get("capturando", "")
+        for clave, (lugar, cambiar) in filas.items():
+            api.vaciar(lugar)
+            if clave == capturando:
+                lugar.append(Gtk.Label(label="Pulsa la combinación nueva en el teclado…",
+                                       css_classes=["pizarra-esperando"]))
+            elif clave in atajos:
+                lugar.append(teclas_de(atajos[clave]))
+            cambiar.get_child().get_first_child().set_label(
+                "Cancelar" if clave == capturando else "Cambiar")
+        registrados = estado.get("atajos_registrados", False)
+        estado_atajos.set_label(
+            "Registrados en COSMIC: funcionan en cualquier app" if registrados
+            else "Todavía no están en COSMIC: regístralos para usarlos")
+        registrar.get_child().get_first_child().set_label(
+            "Quitar de COSMIC" if registrados else "Registrar en COSMIC")
+        clase(registrar, "principal", not registrados)
+
+    api.al_mostrar(lambda visible: visible and refrescar() or (not visible and abrir_hoja(False)))
 
     pagina = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24, css_classes=["pizarra"])
     pagina.append(cabecera)
     pagina.append(mosaicos)
     pagina.append(ajustes)
-    return pagina
+    raiz = Gtk.Overlay(child=pagina)
+    raiz.add_overlay(capa_hoja)
+    return raiz
