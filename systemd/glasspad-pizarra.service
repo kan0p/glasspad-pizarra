@@ -1,0 +1,11 @@
+[Unit]
+Description=GlassPad Pizarra: escribir, foco y teclas sobre la pantalla principal
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=io.github.kan0p.GlassPad.Pizarra
+ExecStart=@BINDIR@/glasspad-pizarra
+Restart=on-failure
+RestartSec=2

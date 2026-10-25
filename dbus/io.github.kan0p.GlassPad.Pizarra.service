@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.kan0p.GlassPad.Pizarra
+Exec=@BINDIR@/glasspad-pizarra
+SystemdService=glasspad-pizarra.service

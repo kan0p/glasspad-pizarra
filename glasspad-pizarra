@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+# glasspad-pizarra - herramientas para clases sobre la pantalla principal
+# kan0p - https://github.com/kan0p/glasspad-pizarra - GPL-3.0-or-later
+#
+# uso: glasspad-pizarra [--debug]
+#      glasspad-pizarra alternar escribir | deshacer | borrar | apagar
+
+import os, sys
+
+BUS = "io.github.kan0p.GlassPad.Pizarra"
+RUTA = "/io/github/kan0p/GlassPad/Pizarra"
+INTERFAZ = "io.github.kan0p.GlassPad.Pizarra"
+
+
+def cliente(args):
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+    def llamar(metodo, params=None, tipo=None):
+        return bus.call_sync(BUS, RUTA, INTERFAZ, metodo, params,
+                             GLib.VariantType(tipo) if tipo else None,
+                             Gio.DBusCallFlags.NONE, 5000, None)
+
+    try:
+        if args[0] == "alternar" and len(args) == 2 and args[1] in ("escribir",):
+            estado = llamar("Estado", None, "(a{sv})").unpack()[0]
+            llamar("Ajustar", GLib.Variant("(a{sv})", (
+                {args[1]: GLib.Variant("b", not estado[args[1]])},)))
+        elif args == ["deshacer"]:
+            llamar("Deshacer")
+        elif args == ["borrar"]:
+            llamar("Borrar")
+        elif args == ["apagar"]:
+            llamar("ApagarTodo")
+        else:
+            print("uso: glasspad-pizarra alternar escribir | deshacer | borrar | apagar",
+                  file=sys.stderr)
+            return 2
+    except GLib.Error as e:
+        print(f"glasspad-pizarra: {e.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+    sys.exit(cliente(sys.argv[1:]))
+
+# gtk4-layer-shell debe cargarse antes que libwayland-client
+LIB_LAYER = "libgtk4-layer-shell.so.0"
+if LIB_LAYER not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = " ".join(filter(None, [LIB_LAYER, os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+# todo se dibuja con cairo en memoria: sin texturas nuevas de GSK en cada cuadro
+os.environ.setdefault("GSK_RENDERER", "cairo")
+
+import json, math, time
+
+import cairo
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk
+from gi.repository import Gtk4LayerShell as Capa
+try:
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix
+    signal_add = GLibUnix.signal_add
+except (ValueError, ImportError):
+    signal_add = GLib.unix_signal_add
+
+DEBUG = "--debug" in sys.argv
+XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+ESTADO = os.path.join(XDG_STATE, "glasspad", "pizarra.json")
+CONECTOR_PAD = "/var/lib/screenpad/conector"     # lo deja "screenpad on" de GlassPad
+
+HERRAMIENTAS = {"lapiz": "Lápiz", "resaltador": "Resaltador", "laser": "Láser",
+                "flecha": "Flecha", "recuadro": "Recuadro", "borrador": "Borrador"}
+COLORES = {"rojo": "#ff5a4e", "amarillo": "#ffd23f", "verde": "#3ddc84",
+           "azul": "#4c9bff", "blanco": "#ffffff", "negro": "#111111"}
+FONDOS = {"transparente": None, "blanca": (0.98, 0.98, 0.97), "negra": (0.11, 0.125, 0.15)}
+# ancho del trazo en px por grosor (1, 2, 3)
+ANCHOS = {"lapiz": (3, 6, 11), "resaltador": (16, 28, 44), "laser": (4, 7, 11),
+          "flecha": (3, 6, 10), "recuadro": (3, 6, 10), "borrador": (14, 26, 44)}
+LASER_VIVE_S = 1.0       # visible entero después de soltar
+LASER_APAGA_S = 0.5      # y luego se desvanece
+HISTORIAL = 100
+AVISO_S = 2.5
+
+PREDETERMINADO = {"escribir": False, "herramienta": "lapiz", "color": "rojo", "grosor": 2,
+                  "fondo": "transparente", "borrar_al_pasar": True}
+GUARDADOS = ("herramienta", "color", "grosor", "fondo", "borrar_al_pasar")
+
+XML = f"""
+<node>
+  <interface name="{INTERFAZ}">
+    <method name="Ajustar"><arg type="a{{sv}}" name="cambios" direction="in"/></method>
+    <method name="Deshacer"/>
+    <method name="Borrar"/>
+    <method name="ApagarTodo"/>
+    <method name="CambioDiapositiva"/>
+    <method name="Estado"><arg type="a{{sv}}" name="estado" direction="out"/></method>
+    <signal name="Cambio"><arg type="a{{sv}}" name="estado"/></signal>
+  </interface>
+</node>
+"""
+
+CSS = b"""
+window.pizarra { background: transparent; }
+.pizarra-aviso { background: alpha(#12141c, 0.88); color: white; border-radius: 999px;
+                 padding: 9px 18px; font-size: 15px; margin: 24px; }
+.pizarra-aviso .titulo { font-weight: 600; }
+.pizarra-aviso .pista { color: alpha(white, 0.7); }
+.pizarra-punto { min-width: 12px; min-height: 12px; border-radius: 6px; }
+""" + b"".join(f".pizarra-punto.{n} {{ background: {c}; }}\n".encode()
+               for n, c in COLORES.items())
+
+
+def log(*a):
+    print("glasspad-pizarra:", *a, file=sys.stderr, flush=True)
+
+
+def debug(*a):
+    if DEBUG:
+        log(*a)
+
+
+def rgb(hexa):
+    return tuple(int(hexa[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+
+def leer_estado():
+    estado = dict(PREDETERMINADO)
+    try:
+        with open(ESTADO) as f:
+            guardado = json.load(f)
+        for k in GUARDADOS:
+            if k in guardado and valido(k, guardado[k]):
+                estado[k] = guardado[k]
+    except (OSError, ValueError):
+        pass
+    return estado
+
+
+def guardar_estado(estado):
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    tmp = ESTADO + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({k: estado[k] for k in GUARDADOS}, f, indent=1)
+    os.replace(tmp, ESTADO)
+
+
+def valido(clave, valor):
+    return {"escribir": lambda v: isinstance(v, bool),
+            "borrar_al_pasar": lambda v: isinstance(v, bool),
+            "herramienta": lambda v: v in HERRAMIENTAS,
+            "color": lambda v: v in COLORES,
+            "grosor": lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 3,
+            "fondo": lambda v: v in FONDOS}.get(clave, lambda v: False)(valor)
+
+
+def variante(v):
+    if isinstance(v, bool):
+        return GLib.Variant("b", v)
+    if isinstance(v, int):
+        return GLib.Variant("i", v)
+    return GLib.Variant("s", str(v))
+
+
+def distancia_segmento(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    largo = dx * dx + dy * dy
+    t = 0 if largo == 0 else max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / largo))
+    return math.hypot(px - ax - t * dx, py - ay - t * dy)
+
+
+def buscar_pad_conector():
+    try:
+        with open(CONECTOR_PAD) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def monitor_principal():
+    """El primer monitor que no es el ScreenPad, prefiriendo el panel interno."""
+    pad = buscar_pad_conector()
+    monitores = Gdk.Display.get_default().get_monitors()
+    candidatos = []
+    for i in range(monitores.get_n_items()):
+        m = monitores.get_item(i)
+        if m.get_connector() == pad or (not pad and "Toshiba" in (m.get_manufacturer() or "")):
+            continue
+        candidatos.append(m)
+    candidatos.sort(key=lambda m: not (m.get_connector() or "").startswith("eDP"))
+    return candidatos[0] if candidatos else None
+
+
+class Trazo:
+    def __init__(self, herramienta, color, ancho, x, y):
+        self.herramienta = herramienta
+        self.color = rgb(COLORES[color])
+        self.ancho = ancho
+        self.puntos = [(x, y)]
+        self.fin = None          # momento en que se soltó (para el láser)
+
+    def segmentos(self):
+        p = self.puntos
+        if self.herramienta == "flecha":
+            return [(p[0], p[-1])]
+        if self.herramienta == "recuadro":
+            (x0, y0), (x1, y1) = p[0], p[-1]
+            esquinas = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            return list(zip(esquinas, esquinas[1:] + esquinas[:1]))
+        return list(zip(p, p[1:])) or [(p[0], p[0])]
+
+    def toca(self, x, y, radio):
+        alcance = radio + self.ancho / 2
+        return any(distancia_segmento(x, y, *a, *b) <= alcance for a, b in self.segmentos())
+
+    def dibujar(self, cr, vida=1.0):
+        h = self.herramienta
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        if h == "laser":
+            for ancho, color, alfa in ((self.ancho * 3.2, self.color, 0.22),
+                                       (self.ancho, self.color, 0.95),
+                                       (max(1.5, self.ancho * 0.35), (1, 1, 1), 0.9)):
+                self._camino(cr)
+                cr.set_source_rgba(*color, alfa * vida)
+                cr.set_line_width(ancho)
+                cr.stroke()
+            return
+        cr.set_source_rgba(*self.color, 0.4 if h == "resaltador" else 1.0)
+        cr.set_line_width(self.ancho)
+        if h == "flecha":
+            (x0, y0), (x1, y1) = self.puntos[0], self.puntos[-1]
+            cr.move_to(x0, y0)
+            cr.line_to(x1, y1)
+            cr.stroke()
+            if math.hypot(x1 - x0, y1 - y0) > 1:
+                ang = math.atan2(y1 - y0, x1 - x0)
+                punta = 14 + self.ancho * 2.5
+                for d in (math.radians(150), math.radians(-150)):
+                    cr.move_to(x1, y1)
+                    cr.line_to(x1 + punta * math.cos(ang + d), y1 + punta * math.sin(ang + d))
+                cr.stroke()
+        elif h == "recuadro":
+            (x0, y0), (x1, y1) = self.puntos[0], self.puntos[-1]
+            cr.rectangle(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+            cr.stroke()
+        else:
+            self._camino(cr)
+            cr.stroke()
+
+    def _camino(self, cr):
+        p = self.puntos
+        cr.move_to(*p[0])
+        if len(p) == 1:
+            cr.line_to(*p[0])
+            return
+        # curvas por los puntos medios: trazo suave sin esquinas
+        for (x0, y0), (x1, y1) in zip(p[:-1], p[1:]):
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            cx, cy = cr.get_current_point()
+            cr.curve_to(cx + (x0 - cx) * 2 / 3, cy + (y0 - cy) * 2 / 3,
+                        mx + (x0 - mx) * 2 / 3, my + (y0 - my) * 2 / 3, mx, my)
+        cr.line_to(*p[-1])
+
+
+class Pizarra(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=BUS, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.estado = leer_estado()
+        self.paginas = {f: [] for f in FONDOS}      # trazos de cada fondo
+        self.historial = {f: [] for f in FONDOS}
+        self.actual = None          # trazo que se está dibujando
+        self.borrados = False       # el borrador ya quitó algo en este arrastre
+        self.lasers = []
+        self.cache = None           # (pagina, ancho, alto, escala, ImageSurface)
+        self.ventana = None
+        self.area = None
+        self.tic = 0
+        self.espera_aviso = 0
+        self.conexion = None
+
+    # ----- arranque ----------------------------------------------------------
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.hold()
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Gdk.Display.get_default().get_monitors().connect("items-changed", self._monitores)
+        for s in (2, 15):
+            signal_add(GLib.PRIORITY_DEFAULT, s, lambda *_a: self.quit() or False)
+        debug("listo")
+
+    def do_dbus_register(self, conexion, ruta):
+        # antes de tomar el nombre: así ninguna llamada llega sin el objeto registrado
+        Gtk.Application.do_dbus_register(self, conexion, ruta)
+        info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+        self.conexion = conexion
+        self.registro = conexion.register_object(RUTA, info, self._llamada, None, None)
+        return True
+
+    def do_dbus_unregister(self, conexion, ruta):
+        conexion.unregister_object(self.registro)
+        Gtk.Application.do_dbus_unregister(self, conexion, ruta)
+
+    def do_activate(self):
+        pass
+
+    def _monitores(self, *_a):
+        # la salida del pad aparece y desaparece en cada cambio de modo
+        GLib.timeout_add(500, self._revisar_monitor)
+
+    def _revisar_monitor(self):
+        if self.ventana and self.ventana.get_visible():
+            m = monitor_principal()
+            if m and m != Capa.get_monitor(self.ventana):
+                debug("monitor principal:", m.get_connector())
+                self.ventana.destroy()
+                self.ventana = None
+                self._actualizar()
+        return False
+
+    # ----- D-Bus -------------------------------------------------------------
+
+    def _llamada(self, _con, _remitente, _ruta, _interfaz, metodo, params, invocacion):
+        debug("D-Bus", metodo, params.unpack() if params else "")
+        if metodo == "Estado":
+            invocacion.return_value(GLib.Variant("(a{sv})", (self._estado_dbus(),)))
+            return
+        if metodo == "Ajustar":
+            cambios = params.unpack()[0]
+            malos = [k for k, v in cambios.items() if not valido(k, v)]
+            if malos:
+                invocacion.return_dbus_error(f"{INTERFAZ}.Error.Invalido",
+                                             "valor no válido: " + ", ".join(malos))
+                return
+            self._ajustar(cambios)
+        elif metodo == "Deshacer":
+            self._deshacer()
+        elif metodo == "Borrar":
+            self._borrar()
+        elif metodo == "ApagarTodo":
+            for f in FONDOS:
+                self.paginas[f] = []
+                self.historial[f] = []
+            self.lasers = []
+            self._ajustar({"escribir": False})
+        elif metodo == "CambioDiapositiva":
+            if self.estado["borrar_al_pasar"] and self.paginas["transparente"]:
+                self._guardar_historial("transparente")
+                self.paginas["transparente"] = []
+                self._cambio()
+        invocacion.return_value(None)
+
+    def _estado_dbus(self):
+        d = {k: variante(v) for k, v in self.estado.items()}
+        pagina = self._pagina()
+        d["puede_deshacer"] = variante(bool(self.historial[pagina]))
+        d["hay_dibujo"] = variante(any(self.paginas.values()))
+        return d
+
+    def _cambio(self):
+        self.cache = None
+        self._actualizar()
+        if self.conexion:
+            self.conexion.emit_signal(None, RUTA, INTERFAZ, "Cambio",
+                                      GLib.Variant("(a{sv})", (self._estado_dbus(),)))
+
+    def _ajustar(self, cambios):
+        antes = dict(self.estado)
+        self.estado.update(cambios)
+        if any(self.estado[k] != antes[k] for k in GUARDADOS):
+            try:
+                guardar_estado(self.estado)
+            except OSError as e:
+                log(f"no se pudo guardar {ESTADO}: {e}")
+        aviso = self.estado["escribir"] and (not antes["escribir"] or any(
+            self.estado[k] != antes[k] for k in ("herramienta", "color", "fondo")))
+        self._cambio()
+        if aviso:
+            self._mostrar_aviso()
+
+    # ----- páginas e historial ----------------------------------------------
+
+    def _pagina(self):
+        """Con Escribir apagado se ve siempre lo dibujado sobre la diapositiva."""
+        return self.estado["fondo"] if self.estado["escribir"] else "transparente"
+
+    def _guardar_historial(self, pagina):
+        h = self.historial[pagina]
+        h.append(list(self.paginas[pagina]))
+        del h[:-HISTORIAL]
+
+    def _deshacer(self):
+        pagina = self._pagina()
+        if self.historial[pagina]:
+            self.paginas[pagina] = self.historial[pagina].pop()
+            self._cambio()
+
+    def _borrar(self):
+        pagina = self._pagina()
+        if self.paginas[pagina]:
+            self._guardar_historial(pagina)
+            self.paginas[pagina] = []
+        self.lasers = []
+        self._cambio()
+
+    # ----- ventana -----------------------------------------------------------
+
+    def _necesita_ventana(self):
+        return self.estado["escribir"] or bool(self.paginas["transparente"]) or bool(self.lasers)
+
+    def _crear_ventana(self):
+        m = monitor_principal()
+        v = Gtk.ApplicationWindow(application=self, css_classes=["pizarra"])
+        Capa.init_for_window(v)
+        Capa.set_namespace(v, "glasspad-pizarra")
+        if m:
+            Capa.set_monitor(v, m)
+        for borde in (Capa.Edge.TOP, Capa.Edge.BOTTOM, Capa.Edge.LEFT, Capa.Edge.RIGHT):
+            Capa.set_anchor(v, borde, True)
+        Capa.set_exclusive_zone(v, -1)
+        Capa.set_keyboard_mode(v, Capa.KeyboardMode.NONE)
+        Capa.set_layer(v, Capa.Layer.OVERLAY)
+
+        self.area = Gtk.DrawingArea(hexpand=True, vexpand=True)
+        self.area.set_draw_func(self._dibujar)
+        arrastre = Gtk.GestureDrag(button=Gdk.BUTTON_PRIMARY)
+        arrastre.connect("drag-begin", self._empezar)
+        arrastre.connect("drag-update", self._seguir)
+        arrastre.connect("drag-end", self._terminar)
+        self.area.add_controller(arrastre)
+
+        self.aviso = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.CROSSFADE,
+                                  transition_duration=250, halign=Gtk.Align.END,
+                                  valign=Gtk.Align.START, can_target=False)
+        caja = Gtk.Box(spacing=10, css_classes=["pizarra-aviso"])
+        self.aviso_punto = Gtk.Box(css_classes=["pizarra-punto"], valign=Gtk.Align.CENTER)
+        self.aviso_titulo = Gtk.Label(css_classes=["titulo"])
+        self.aviso_pista = Gtk.Label(css_classes=["pista"])
+        for w in (self.aviso_punto, self.aviso_titulo, self.aviso_pista):
+            caja.append(w)
+        self.aviso.set_child(caja)
+
+        capas = Gtk.Overlay(child=self.area)
+        capas.add_overlay(self.aviso)
+        v.set_child(capas)
+        v.connect("realize", lambda _v: self._region())
+        self.ventana = v
+
+    def _actualizar(self):
+        """Muestra u oculta la capa y decide si toma el mouse."""
+        if not self._necesita_ventana():
+            if self.ventana and self.ventana.get_visible():
+                self.ventana.set_visible(False)
+            return
+        if self.ventana is None:
+            self._crear_ventana()
+        if not self.ventana.get_visible():
+            self.ventana.present()
+        self._region()
+        self.area.set_cursor_from_name(
+            ("cell" if self.estado["herramienta"] == "borrador" else "crosshair")
+            if self.estado["escribir"] else None)
+        self.area.queue_draw()
+
+    def _region(self):
+        superficie = self.ventana.get_surface() if self.ventana else None
+        if superficie is None:
+            return
+        # región vacía: los clics pasan a la ventana de abajo
+        superficie.set_input_region(None if self.estado["escribir"] else cairo.Region())
+
+    def _mostrar_aviso(self):
+        if not self.ventana:
+            return
+        e = self.estado
+        for c in COLORES:
+            self.aviso_punto.remove_css_class(c)
+        self.aviso_punto.add_css_class(e["color"])
+        self.aviso_punto.set_visible(e["herramienta"] != "borrador")
+        nombre = HERRAMIENTAS[e["herramienta"]]
+        if e["herramienta"] not in ("borrador",):
+            nombre += " " + e["color"]
+        if e["fondo"] != "transparente":
+            nombre += " · pizarra " + e["fondo"]
+        self.aviso_titulo.set_label("Escribiendo")
+        self.aviso_pista.set_label(f"{nombre} · el mouse dibuja; apágalo desde el pad")
+        self.aviso.set_reveal_child(True)
+        if self.espera_aviso:
+            GLib.source_remove(self.espera_aviso)
+        self.espera_aviso = GLib.timeout_add(int(AVISO_S * 1000), self._ocultar_aviso)
+
+    def _ocultar_aviso(self):
+        self.espera_aviso = 0
+        self.aviso.set_reveal_child(False)
+        return False
+
+    # ----- dibujo ------------------------------------------------------------
+
+    def _dibujar(self, area, cr, ancho, alto):
+        pagina = self._pagina()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        fondo = FONDOS[pagina]
+        if fondo:
+            cr.set_source_rgb(*fondo)
+        else:
+            cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_source_surface(self._cache(pagina, ancho, alto), 0, 0)
+        cr.paint()
+        if self.actual and self.actual.herramienta != "laser":
+            self.actual.dibujar(cr)
+        ahora = time.monotonic()
+        for t in self.lasers:
+            if t.fin is None:
+                vida = 1.0
+            else:
+                vida = max(0.0, 1 - max(0.0, ahora - t.fin - LASER_VIVE_S) / LASER_APAGA_S)
+            t.dibujar(cr, vida)
+
+    def _cache(self, pagina, ancho, alto):
+        """Los trazos terminados en una imagen; se rehace solo cuando cambian."""
+        superficie = self.ventana.get_surface()
+        escala = superficie.get_scale() if hasattr(superficie, "get_scale") \
+            else superficie.get_scale_factor()
+        clave = (pagina, ancho, alto, escala)
+        if self.cache and self.cache[0] == clave:
+            return self.cache[1]
+        img = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, math.ceil(ancho * escala)),
+                                 max(1, math.ceil(alto * escala)))
+        img.set_device_scale(escala, escala)
+        cr = cairo.Context(img)
+        for t in self.paginas[pagina]:
+            t.dibujar(cr)
+        self.cache = (clave, img)
+        return img
+
+    def _empezar(self, gesto, x, y):
+        e = self.estado
+        if not e["escribir"]:
+            return
+        h = e["herramienta"]
+        self.actual = Trazo(h, e["color"], ANCHOS[h][e["grosor"] - 1], x, y)
+        self.borrados = False
+        if h == "laser":
+            self.lasers.append(self.actual)
+            self._animar()
+        elif h == "borrador":
+            self._borrar_en(x, y)
+        self.area.queue_draw()
+
+    def _seguir(self, gesto, dx, dy):
+        if not self.actual:
+            return
+        ok, x0, y0 = gesto.get_start_point()
+        x, y = x0 + dx, y0 + dy
+        px, py = self.actual.puntos[-1]
+        if self.actual.herramienta in ("flecha", "recuadro"):
+            self.actual.puntos[1:] = [(x, y)]
+        elif math.hypot(x - px, y - py) >= 1.5:
+            self.actual.puntos.append((x, y))
+        if self.actual.herramienta == "borrador":
+            self._borrar_en(x, y)
+        self.area.queue_draw()
+
+    def _terminar(self, gesto, dx, dy):
+        t, self.actual = self.actual, None
+        if t is None:
+            return
+        pagina = self._pagina()
+        if t.herramienta == "laser":
+            t.fin = time.monotonic()
+        elif t.herramienta == "borrador":
+            if self.borrados:
+                self._cambio()
+        elif t.herramienta in ("flecha", "recuadro") and len(t.puntos) < 2:
+            pass
+        else:
+            self._guardar_historial(pagina)
+            self.paginas[pagina].append(t)
+            self._cambio()
+        self.area.queue_draw()
+
+    def _borrar_en(self, x, y):
+        pagina = self._pagina()
+        radio = self.actual.ancho / 2
+        quedan = [t for t in self.paginas[pagina] if not t.toca(x, y, radio)]
+        if len(quedan) != len(self.paginas[pagina]):
+            if not self.borrados:
+                self._guardar_historial(pagina)
+                self.borrados = True
+            self.paginas[pagina] = quedan
+            self.cache = None
+
+    def _animar(self):
+        if not self.tic:
+            self.tic = self.area.add_tick_callback(self._paso_laser)
+
+    def _paso_laser(self, area, _reloj):
+        ahora = time.monotonic()
+        self.lasers = [t for t in self.lasers
+                       if t.fin is None or ahora - t.fin < LASER_VIVE_S + LASER_APAGA_S]
+        area.queue_draw()
+        if self.lasers:
+            return True
+        self.tic = 0
+        self._actualizar()
+        return False
+
+
+if __name__ == "__main__":
+    sys.exit(Pizarra().run([sys.argv[0]]))
