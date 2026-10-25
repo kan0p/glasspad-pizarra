@@ -26,18 +26,6 @@ La Pizarra es un complemento de GlassPad y solo tiene sentido con él: se maneja
 - `python-cairo` y `gtk4-layer-shell`
 - Para Teclas, la marca de clics y cambiar atajos: `python-evdev` y `polkit`
 
-## Si algo no está soportado
-
-Nada falla en silencio: si una herramienta no puede funcionar, se apaga y el ScreenPad muestra el motivo (también queda en `journalctl --user -u glasspad-pizarra`).
-
-| Situación | Qué pasa |
-|---|---|
-| El escritorio no tiene capas superpuestas (`wlr-layer-shell`), como GNOME | Escribir, Foco y Teclas no se encienden y lo avisan |
-| El escritorio no informa la posición del cursor (`ext-image-copy-capture-v1`) | El Foco se apaga y dice qué protocolo falta |
-| Falta la parte del sistema o polkit no da permiso | Teclas se apaga y dice cómo instalarla |
-| El escritorio no es COSMIC | **Registrar en COSMIC** avisa que no puede |
-| `glasspad-pizarra` no responde | El pad avisa que no puede hablar con él |
-
 ## Instalación
 
 ```sh
