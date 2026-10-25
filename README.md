@@ -4,6 +4,18 @@ Herramientas para dar clases con el ScreenPad de la ZenBook Pro 15 UX580: escrib
 
 Funciona encima de cualquier ventana, también de una presentación a pantalla completa (PowerPoint Online, Google Slides, LibreOffice Impress): las herramientas se dibujan en una capa por encima de todo y el teclado sigue llegando a la presentación.
 
+![La página Pizarra en el ScreenPad](capturas/pad-escribir.jpg)
+
+| | | |
+|:-:|:-:|:-:|
+| ![Foco](capturas/pad-foco.jpg) Foco | ![Teclas](capturas/pad-teclas.jpg) Teclas | ![Atajos de teclado](capturas/pad-atajos.jpg) Atajos de teclado |
+
+En la pantalla principal (imágenes de ejemplo, dibujadas con el código de la Pizarra sobre una diapositiva):
+
+| | |
+|:-:|:-:|
+| ![Escribir y Teclas sobre una diapositiva](capturas/pantalla-escribir.jpg) Escribir y Teclas | ![Foco sobre una diapositiva](capturas/pantalla-foco.jpg) Foco |
+
 ## Requisitos
 
 La Pizarra es un complemento de GlassPad y solo tiene sentido con él: se maneja desde el ScreenPad, y sin el launcher no hay dónde elegir herramientas ni ajustes. El instalador se niega a seguir si falta algo de esto:
