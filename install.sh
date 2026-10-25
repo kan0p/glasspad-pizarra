@@ -15,6 +15,31 @@ DBUS=$DATOS/dbus-1/services/io.github.kan0p.GlassPad.Pizarra.service
 LIBEXEC=/usr/local/libexec
 # polkit solo lee acciones de /usr/share
 POLITICA=/usr/share/polkit-1/actions/io.github.kan0p.glasspad.pizarra.policy
+GLASSPAD_MINIMO=0.9.1
+
+# La Pizarra es un complemento de GlassPad: sin el ScreenPad y el launcher no hay dónde manejarla.
+requisitos() {
+    modelo=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+    case "$modelo" in
+        *UX580*) ;;
+        *)
+            echo "GlassPad Pizarra necesita el ScreenPad de la ASUS ZenBook Pro 15 UX580." >&2
+            echo "Este equipo es: ${modelo:-desconocido}" >&2
+            exit 1 ;;
+    esac
+    config=$(command -v glasspad-config || true)
+    if [ -z "$config" ] || ! command -v glasspad-launcher >/dev/null; then
+        echo "GlassPad Pizarra es un complemento de GlassPad: instala GlassPad $GLASSPAD_MINIMO o" >&2
+        echo "posterior (https://github.com/kan0p/asus-screenpad-linux)." >&2
+        exit 1
+    fi
+    version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$config")
+    menor=$(printf '%s\n%s\n' "$GLASSPAD_MINIMO" "$version" | sort -V | head -n1)
+    if [ -z "$version" ] || [ "$menor" != "$GLASSPAD_MINIMO" ]; then
+        echo "GlassPad ${version:-desconocido} no carga complementos: actualiza a $GLASSPAD_MINIMO o posterior." >&2
+        exit 1
+    fi
+}
 
 if [ "${1:-}" = "--sistema" ]; then
     if [ "$(id -u)" != 0 ]; then
@@ -26,6 +51,7 @@ if [ "${1:-}" = "--sistema" ]; then
         echo "Lector de teclas quitado."
         exit 0
     fi
+    requisitos
     if ! python3 -c "import evdev" 2>/dev/null; then
         echo "Falta python-evdev. En Arch: pacman -S python-evdev" >&2
         exit 1
@@ -59,11 +85,19 @@ if [ "${1:-}" = "--quitar" ]; then
     exit 0
 fi
 
+requisitos
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "GlassPad Pizarra funciona en una sesión Wayland (COSMIC); esta sesión no lo es." >&2
+    exit 1
+fi
+if ! systemctl --user -q is-active glasspad-launcher 2>/dev/null; then
+    echo "Aviso: GlassPad Launcher no está corriendo; la página Pizarra aparece cuando arranque."
+fi
+
 falta=""
 python3 -c "import cairo" 2>/dev/null || falta="$falta python-cairo"
 python3 -c "import gi; gi.require_version('Gtk4LayerShell', '1.0')" 2>/dev/null \
     || falta="$falta gtk4-layer-shell"
-command -v wtype >/dev/null || falta="$falta wtype"
 if [ -n "$falta" ]; then
     echo "Faltan dependencias:$falta" >&2
     echo "En Arch: sudo pacman -S$falta" >&2

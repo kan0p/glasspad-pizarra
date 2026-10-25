@@ -112,10 +112,14 @@ def crear(api):
             try:
                 r = con.call_finish(res)
             except GLib.Error as e:
-                if not avisado[0]:
-                    avisado[0] = True
-                    api.avisar("No se pudo hablar con glasspad-pizarra")
+                propio = (Gio.DBusError.get_remote_error(e) or "").startswith(INTERFAZ)
+                Gio.DBusError.strip_remote_error(e)
                 print(f"pizarra: {metodo}: {e.message}", flush=True)
+                if propio:
+                    api.avisar(e.message)       # el programa dice por qué no se pudo
+                elif not avisado[0]:
+                    avisado[0] = True
+                    api.avisar("No se pudo hablar con glasspad-pizarra: " + e.message)
                 return
             avisado[0] = False
             if despues:

@@ -37,6 +37,7 @@ def cliente(args):
                   file=sys.stderr)
             return 2
     except GLib.Error as e:
+        Gio.DBusError.strip_remote_error(e)
         print(f"glasspad-pizarra: {e.message}", file=sys.stderr)
         return 1
     return 0
@@ -270,11 +271,17 @@ class Foco:
     ONDAS = {"izquierdo": (0.96, 0.78, 0.30), "derecho": (0.42, 0.66, 1.0),
              "medio": (1.0, 1.0, 1.0)}
 
-    def __init__(self, conector, escala, ajustes):
+    def __init__(self, conector, escala, ajustes, al_fallar):
         self.conector = conector
         self.escala = escala
         self.ajustes = ajustes          # dict con radio, oscuro y anillo; se lee en cada cuadro
+        self.al_fallar = al_fallar      # al_fallar(texto) si el foco no puede seguir
         self.s = None
+
+    def _fallar(self, texto):
+        log("foco:", texto)
+        self.detener()
+        self.al_fallar(texto)
 
     # ----- conexión ----------------------------------------------------------
 
@@ -287,8 +294,8 @@ class Foco:
             self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.s.connect(ruta)
         except OSError as e:
-            log(f"foco: no se pudo conectar a Wayland: {e}")
             self.s = None
+            self._fallar(f"No se pudo conectar a Wayland: {e.strerror}")
             return
         self.s.setblocking(False)
         self.buf = b""
@@ -354,8 +361,7 @@ class Foco:
                 self.s.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                         array.array("i", [fd]))])
         except OSError as e:
-            log(f"foco: error de Wayland: {e}")
-            GLib.idle_add(lambda: self.detener() and False)
+            GLib.idle_add(lambda: self.s and self._fallar(f"Error de Wayland: {e.strerror}") and False)
 
     def _sync(self, para):
         self._enviar(1, 0, struct.pack("<I", self._nuevo("sync:" + para)))
@@ -377,8 +383,7 @@ class Foco:
 
     def _leer(self, _fd, condicion):
         if condicion & (GLib.IO_HUP | GLib.IO_ERR):
-            log("foco: se cerró la conexión con Wayland")
-            self.detener()
+            self._fallar("El escritorio cerró la conexión")
             return False
         try:
             datos = self.s.recv(65536)
@@ -387,7 +392,7 @@ class Foco:
         except OSError:
             datos = b""
         if not datos:
-            self.detener()
+            self._fallar("El escritorio cerró la conexión")
             return False
         self.buf += datos
         while len(self.buf) >= 8:
@@ -407,8 +412,8 @@ class Foco:
         if obj == 1:
             if op == 0:
                 largo = struct.unpack("<I", b[8:12])[0]
-                log("foco: error del compositor:", b[12:12 + largo - 1].decode(errors="replace"))
-                self.detener()
+                self._fallar("El escritorio rechazó el foco: "
+                             + b[12:12 + largo - 1].decode(errors="replace"))
             elif op == 1:
                 self.objetos.pop(struct.unpack("<I", b)[0], None)
         elif tipo == "registro" and op == 0:
@@ -423,8 +428,8 @@ class Foco:
                                   "ext_output_image_capture_source_manager_v1")
                       if i not in self.globales]
             if faltan:
-                log("foco: el compositor no tiene", ", ".join(faltan))
-                self.detener()
+                self._fallar("Este escritorio no es compatible (le falta "
+                             + ", ".join(faltan) + ")")
                 return
             for nombre, _v in self.globales["wl_output"]:
                 self.salidas[self._enlazar("wl_output", 4, nombre)] = None
@@ -440,7 +445,7 @@ class Foco:
                 self._enviar(obj, 6, struct.pack("<I", serie))
                 self._buferes(ancho, alto)
             elif op == 1:
-                self.detener()
+                self._fallar("El escritorio cerró la capa del foco")
         elif tipo == "cuadro":
             self.cuadro = False
             if self.sucio:
@@ -468,7 +473,7 @@ class Foco:
                 if not self.frame:
                     self._capturar()
             elif op == 5:
-                self.detener()
+                self._fallar("El escritorio dejó de informar la posición del cursor")
         elif tipo == "frame" and op in (3, 4):
             self._enviar(obj, 0)
             self.frame = None
@@ -482,8 +487,7 @@ class Foco:
     def _crear(self):
         self.salida = next((o for o, n in self.salidas.items() if n == self.conector), None)
         if self.salida is None:
-            log(f"foco: no está la salida {self.conector}")
-            self.detener()
+            self._fallar(f"No se encontró la pantalla {self.conector}")
             return
         compositor = self._enlazar("wl_compositor", 4)
         self.shm = self._enlazar("wl_shm", 1)
@@ -1233,6 +1237,10 @@ class Pizarra(Gtk.Application):
                 invocacion.return_dbus_error(f"{INTERFAZ}.Error.Invalido",
                                              "valor no válido: " + ", ".join(malos))
                 return
+            problema = self._no_soportado(cambios)
+            if problema:
+                invocacion.return_dbus_error(f"{INTERFAZ}.Error.NoSoportado", problema)
+                return
             self._ajustar(cambios)
         elif metodo == "Deshacer":
             self._deshacer()
@@ -1263,6 +1271,17 @@ class Pizarra(Gtk.Application):
                 self._cambio()
         invocacion.return_value(None)
 
+    def _no_soportado(self, cambios):
+        """Por qué no se puede encender lo pedido, o None."""
+        encender = [k for k in ("escribir", "foco", "teclas") if cambios.get(k) is True]
+        if not encender:
+            return None
+        if not Capa.is_supported():
+            return "Este escritorio no permite capas superpuestas (wlr-layer-shell)"
+        if not monitor_principal():
+            return "No se encontró la pantalla principal"
+        return None
+
     def _estado_dbus(self):
         d = {k: variante(v) for k, v in self.estado.items()}
         pagina = self._pagina()
@@ -1288,6 +1307,7 @@ class Pizarra(Gtk.Application):
                 guardar_estado(self.estado)
             except OSError as e:
                 log(f"no se pudo guardar {ESTADO}: {e}")
+                self._avisar(f"No se pudieron guardar los ajustes: {e.strerror}")
         aviso = self.estado["escribir"] and (not antes["escribir"] or any(
             self.estado[k] != antes[k] for k in ("herramienta", "color", "fondo")))
         if self.estado["foco"] != antes["foco"]:
@@ -1378,6 +1398,9 @@ class Pizarra(Gtk.Application):
 
     def _registrar(self, si):
         """Pone o quita las entradas de la Pizarra en los atajos propios de COSMIC."""
+        if si and not os.path.exists(COSMIC_ATAJOS):
+            self._avisar("Los atajos se registran en COSMIC, y este escritorio no lo es")
+            return
         texto = leer(COSMIC_PROPIOS)
         lineas = [l for l in texto.splitlines(keepends=True) if "glasspad-pizarra " not in l]
         cuerpo = "".join(lineas).rstrip()
@@ -1443,8 +1466,13 @@ class Pizarra(Gtk.Application):
         m = monitor_principal()
         if m and not self.foco:
             escala = m.get_scale() if hasattr(m, "get_scale") else m.get_scale_factor()
-            self.foco = Foco(m.get_connector(), escala, self.estado)
+            self.foco = Foco(m.get_connector(), escala, self.estado, self._fallo_foco)
             self.foco.iniciar()
+
+    def _fallo_foco(self, texto):
+        self.foco = None
+        self._avisar("Foco: " + texto)
+        GLib.idle_add(lambda: self.estado["foco"] and self._ajustar({"foco": False}) and False)
 
     # ----- páginas e historial ----------------------------------------------
 
